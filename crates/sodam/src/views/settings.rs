@@ -501,6 +501,7 @@ pub(crate) fn settings_view(root: &Root, cx: &mut Context<Root>) -> AnyElement {
                 .children(rows),
         )
         .child(super::shortcut_card::section(root, cx))
+        .child(download_section(root, cx))
         .child({
             // 缓存：显示占用大小 + 一键清理（统计读后台快照，不在渲染路径扫盘）
             let (audio_bytes, audio_files, cover_bytes, cover_files) = root.cache_summary;
@@ -717,5 +718,378 @@ pub(crate) fn settings_view(root: &Root, cx: &mut Context<Root>) -> AnyElement {
                         .text_color(theme::text_faint()),
                 )
         })
+        .into_any_element()
+}
+
+// ---------------------------------------------------------------------------
+// 下载设置
+// ---------------------------------------------------------------------------
+
+/// 一行「标签 + 说明」。
+fn setting_row(label: String, hint: String, control: AnyElement) -> AnyElement {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .gap(px(theme::space::LG))
+        .px(px(theme::space::MD))
+        .py(px(theme::space::SM))
+        .rounded(px(theme::radius::ROW))
+        .hover(|style| style.bg(theme::surface_hover()))
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .min_w(px(0.0))
+                .child(
+                    div()
+                        .text_size(theme::Text::Body.size())
+                        .text_color(theme::text())
+                        .child(label),
+                )
+                .child(
+                    div()
+                        .text_size(theme::Text::Tiny.size())
+                        .text_color(theme::text_faint())
+                        .child(hint),
+                ),
+        )
+        .child(div().flex_none().child(control))
+        .into_any_element()
+}
+
+/// 分段选择器（音质 / 并发数 / 已存在策略都用它）。
+fn segmented<T: Clone + PartialEq + 'static>(
+    id_prefix: &'static str,
+    options: Vec<(T, String)>,
+    current: &T,
+    on_select: impl Fn(T, &mut Root, &mut Context<Root>) + 'static,
+    cx: &mut Context<Root>,
+) -> AnyElement {
+    let entity = cx.entity();
+    let current = current.clone();
+    let on_select = std::rc::Rc::new(on_select);
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(theme::space::XS))
+        .children(
+            options
+                .into_iter()
+                .enumerate()
+                .map(|(index, (value, label))| {
+                    let selected = value == current;
+                    let entity = entity.clone();
+                    let on_select = on_select.clone();
+                    div()
+                        .id(gpui::ElementId::Name(format!("{id_prefix}-{index}").into()))
+                        .px(px(theme::space::MD))
+                        .py(px(theme::space::XS))
+                        .rounded(px(theme::radius::PILL))
+                        .cursor_pointer()
+                        .when(selected, |this| this.bg(theme::accent_soft()))
+                        .when(!selected, |this| this.bg(theme::surface_elevated()))
+                        .hover(|style| style.bg(theme::surface_selected()))
+                        .text_size(theme::Text::Small.size())
+                        .text_color(if selected {
+                            theme::accent()
+                        } else {
+                            theme::text_muted()
+                        })
+                        .on_click(move |_event: &ClickEvent, _window, cx: &mut gpui::App| {
+                            let on_select = on_select.clone();
+                            let value = value.clone();
+                            entity.update(cx, |root, cx| on_select(value, root, cx));
+                        })
+                        .child(label)
+                        .into_any_element()
+                }),
+        )
+        .into_any_element()
+}
+
+/// 开关（写入封面 / 写入歌词）。
+fn toggle_switch(
+    id: &'static str,
+    on: bool,
+    on_toggle: impl Fn(&mut Root, &mut Context<Root>) + 'static,
+    cx: &mut Context<Root>,
+) -> AnyElement {
+    let entity = cx.entity();
+    let on_toggle = std::rc::Rc::new(on_toggle);
+    div()
+        .id(id)
+        .flex()
+        .items_center()
+        .w(px(44.0))
+        .h(px(24.0))
+        .p(px(3.0))
+        .rounded(px(theme::radius::PILL))
+        .bg(if on {
+            theme::accent_soft()
+        } else {
+            theme::surface_hover()
+        })
+        .cursor_pointer()
+        .on_click(move |_event: &ClickEvent, _window, cx: &mut gpui::App| {
+            let on_toggle = on_toggle.clone();
+            entity.update(cx, |root, cx| on_toggle(root, cx));
+        })
+        .child(
+            div()
+                .size(px(18.0))
+                .rounded_full()
+                .bg(if on {
+                    theme::accent()
+                } else {
+                    theme::text_faint()
+                })
+                .when(on, |this| this.ml(px(20.0))),
+        )
+        .into_any_element()
+}
+
+/// 设置页 → 下载板块。
+fn download_section(root: &Root, cx: &mut Context<Root>) -> AnyElement {
+    let settings = root.settings.download.clone();
+    let dir = settings.resolve_dir();
+
+    let quality_options: Vec<(String, String)> = [
+        ("auto", root.tr("跟随播放音质")),
+        ("lossless", root.tr("无损")),
+        ("highest", root.tr("极高")),
+        ("medium", root.tr("较高")),
+        ("low", root.tr("标准")),
+    ]
+    .into_iter()
+    .map(|(value, label)| (value.to_string(), label.to_string()))
+    .collect();
+    let quality_current = {
+        let value = settings.quality.trim();
+        if value.is_empty() {
+            "auto".to_string()
+        } else {
+            value.to_string()
+        }
+    };
+    let quality_control = segmented(
+        "download-quality",
+        quality_options,
+        &quality_current,
+        |value: String, root, cx| {
+            let mut next = root.settings.download.clone();
+            next.quality = value;
+            root.apply_download_settings(next, cx);
+        },
+        cx,
+    );
+
+    let concurrent_control = segmented(
+        "download-concurrent",
+        (1u8..=3).map(|value| (value, value.to_string())).collect(),
+        &settings.concurrent(),
+        |value: u8, root, cx| {
+            let mut next = root.settings.download.clone();
+            next.concurrent = value;
+            root.apply_download_settings(next, cx);
+        },
+        cx,
+    );
+
+    let retry_control = segmented(
+        "download-retry",
+        (0u8..=3).map(|value| (value, value.to_string())).collect(),
+        &settings.retry_count().min(3),
+        |value: u8, root, cx| {
+            let mut next = root.settings.download.clone();
+            next.retry_count = value;
+            root.apply_download_settings(next, cx);
+        },
+        cx,
+    );
+
+    let overwrite_control = segmented(
+        "download-overwrite",
+        vec![
+            (false, root.tr("跳过").to_string()),
+            (true, root.tr("覆盖").to_string()),
+        ],
+        &settings.overwrite,
+        |value: bool, root, cx| {
+            let mut next = root.settings.download.clone();
+            next.overwrite = value;
+            root.apply_download_settings(next, cx);
+        },
+        cx,
+    );
+
+    // 命名模板：三档预设（自定义模板直接在 config.json 里改）。
+    let naming_current = settings.naming().to_string();
+    let naming_control = segmented(
+        "download-naming",
+        sodam_core::download::NAMING_PRESETS
+            .iter()
+            .map(|preset| ((*preset).to_string(), (*preset).to_string()))
+            .collect(),
+        &naming_current,
+        |value: String, root, cx| {
+            let mut next = root.settings.download.clone();
+            next.naming = value;
+            root.apply_download_settings(next, cx);
+        },
+        cx,
+    );
+
+    let cover_control = {
+        let write_cover = settings.write_cover;
+        toggle_switch(
+            "download-cover",
+            write_cover,
+            move |root, cx| {
+                let mut next = root.settings.download.clone();
+                next.write_cover = !write_cover;
+                root.apply_download_settings(next, cx);
+            },
+            cx,
+        )
+    };
+    let lyrics_control = {
+        let write_lyrics = settings.write_lyrics;
+        toggle_switch(
+            "download-lyrics",
+            write_lyrics,
+            move |root, cx| {
+                let mut next = root.settings.download.clone();
+                next.write_lyrics = !write_lyrics;
+                root.apply_download_settings(next, cx);
+            },
+            cx,
+        )
+    };
+
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(theme::space::SM))
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(theme::space::XS))
+                .child(
+                    div()
+                        .text_size(theme::Text::Large.size())
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(theme::text())
+                        .child(root.tr("下载设置")),
+                )
+                .child(
+                    div()
+                        .text_size(theme::Text::Small.size())
+                        .text_color(theme::text_muted())
+                        .child(root.tr("下载音质与播放音质分开：批量下载不会抢最高档")),
+                ),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(theme::space::XS))
+                .child(setting_row(
+                    root.tr("下载音质").to_string(),
+                    root.tr("空 = 跟随播放音质；下载任务创建后不受后续改动影响")
+                        .to_string(),
+                    quality_control,
+                ))
+                .child(setting_row(
+                    root.tr("下载位置").to_string(),
+                    root.localized("下载目录：{}", &[dir.display().to_string()]),
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(theme::space::SM))
+                        .child(
+                            div()
+                                .id("download-open-dir")
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .h(px(theme::size::CONTROL_SM))
+                                .px(px(theme::space::MD))
+                                .rounded(px(theme::radius::ROW))
+                                .bg(theme::surface_elevated())
+                                .cursor_pointer()
+                                .hover(|style| style.bg(theme::surface_hover()))
+                                .text_size(theme::Text::Small.size())
+                                .text_color(theme::text())
+                                .on_click(cx.listener(|root, _event: &ClickEvent, _window, cx| {
+                                    root.open_download_dir(cx);
+                                }))
+                                .child(root.tr("打开文件夹")),
+                        )
+                        .child(
+                            div()
+                                .id("download-open-config")
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .h(px(theme::size::CONTROL_SM))
+                                .px(px(theme::space::MD))
+                                .rounded(px(theme::radius::ROW))
+                                .bg(theme::surface_elevated())
+                                .cursor_pointer()
+                                .hover(|style| style.bg(theme::surface_hover()))
+                                .text_size(theme::Text::Small.size())
+                                .text_color(theme::text())
+                                .on_click(cx.listener(|root, _event: &ClickEvent, _window, cx| {
+                                    root.open_config_file(cx);
+                                }))
+                                .child(root.tr("编辑路径")),
+                        )
+                        .into_any_element(),
+                ))
+                .child(setting_row(
+                    root.tr("文件命名").to_string(),
+                    root.tr("命名模板支持 {artist} / {title} / {album}；用 / 分层")
+                        .to_string(),
+                    naming_control,
+                ))
+                .child(setting_row(
+                    root.tr("写入封面").to_string(),
+                    root.tr("在同目录写一份封面图片").to_string(),
+                    cover_control,
+                ))
+                .child(setting_row(
+                    root.tr("写入歌词").to_string(),
+                    root.tr("在同目录写 .lrc（标准行级时间轴）").to_string(),
+                    lyrics_control,
+                ))
+                .child(setting_row(
+                    root.tr("同时下载数").to_string(),
+                    root.tr("并发越高越吃带宽与签名服务；建议 2").to_string(),
+                    concurrent_control,
+                ))
+                .child(setting_row(
+                    root.tr("失败重试").to_string(),
+                    root.tr("网络类错误自动重试；试听 / 无权限不重试")
+                        .to_string(),
+                    retry_control,
+                ))
+                .child(setting_row(
+                    root.tr("已存在文件").to_string(),
+                    root.tr("按曲目 id 与命名模板判断目标文件是否已存在")
+                        .to_string(),
+                    overwrite_control,
+                )),
+        )
+        .child(
+            div()
+                .text_size(theme::Text::Tiny.size())
+                .text_color(theme::text_faint())
+                .child(root.tr("缓存目录（播放用）与下载目录分开，清缓存不会删掉下载")),
+        )
         .into_any_element()
 }

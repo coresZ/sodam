@@ -318,18 +318,12 @@ fn format_seconds(seconds: f64) -> String {
 
 /// 音频缓存目录。
 pub fn cache_dir() -> std::path::PathBuf {
-    dirs::cache_dir()
-        .unwrap_or_else(std::env::temp_dir)
-        .join("sodam")
-        .join("audio")
+    crate::paths::cache_dir().join("audio")
 }
 
 /// 封面缓存目录。
 pub fn cover_cache_dir() -> std::path::PathBuf {
-    dirs::cache_dir()
-        .unwrap_or_else(std::env::temp_dir)
-        .join("sodam")
-        .join("covers")
+    crate::paths::cache_dir().join("covers")
 }
 
 /// 目录占用：**递归**统计（字节数，文件数）。

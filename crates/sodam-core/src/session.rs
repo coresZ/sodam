@@ -97,8 +97,26 @@ pub struct CachedTrack {
     pub quality: String,
 }
 
+/// 把 [`crate::models::TrackItem`] 翻成 libresoda 的 `Song`。
+///
+/// 播放缓存与下载两条链路共用同一份构造逻辑：`extra` 里的 `track_id`
+/// 是 libresoda 认的曲目 id（见 `libresoda::soda::download::song_track_id`）。
+pub(crate) fn song_for(track: &crate::models::TrackItem) -> libresoda::Song {
+    libresoda::Song {
+        id: track.id.clone(),
+        name: track.title.clone(),
+        artist: track.artist.clone(),
+        album: track.album.clone(),
+        duration: track.duration_seconds,
+        source: libresoda::model::SOURCE_SODA.to_string(),
+        link: format!("https://www.qishui.com/track/{}", track.id),
+        extra: std::collections::BTreeMap::from([("track_id".to_string(), track.id.clone())]),
+        ..Default::default()
+    }
+}
+
 /// 把 `DownloadInfo` 翻成界面用的音质标签（以**实际拉到的流**为准）。
-fn describe_quality(info: &libresoda::soda::types::DownloadInfo) -> String {
+pub(crate) fn describe_quality(info: &libresoda::soda::types::DownloadInfo) -> String {
     let bitrate = info.bitrate.max(0) / 1000;
     let lossless = libresoda::soda::quality::is_lossless(info)
         || info.format.eq_ignore_ascii_case("flac")
@@ -308,17 +326,7 @@ impl Session {
             return Ok(cached);
         }
 
-        let song = libresoda::Song {
-            id: track.id.clone(),
-            name: track.title.clone(),
-            artist: track.artist.clone(),
-            album: track.album.clone(),
-            duration: track.duration_seconds,
-            source: libresoda::model::SOURCE_SODA.to_string(),
-            link: format!("https://www.qishui.com/track/{}", track.id),
-            extra: std::collections::BTreeMap::from([("track_id".to_string(), track.id.clone())]),
-            ..Default::default()
-        };
+        let song = song_for(track);
         // 先写临时文件，校验完整后再改名 —— 下载中断永远留不下「看起来有效」的半截缓存。
         // 临时名带进程号+序号：预取与手动播放并发下同一首时互不踩踏。
         let part = dir.join(part_file_name(&track.id, &tag));
@@ -422,7 +430,7 @@ impl Session {
 
     /// 封面图本地缓存路径：有缓存就直接返回，没有就下载（失败返回 `None`，界面用占位图）。
     ///
-    /// 封面走 CDN，和音频一样只依赖 URL；缓存目录 `~/.cache/sodam/covers/`，
+    /// 封面走 CDN，和音频一样只依赖 URL；缓存目录见 [`crate::paths::cache_dir`]，
     /// 文件名用 URL 的哈希，避免奇怪字符和重复下载。
     /// 原始封面缓存：歌词页使用原图，列表仍使用缩略图。
     pub fn original_cover_path(&self, url: &str) -> Option<std::path::PathBuf> {
@@ -430,11 +438,7 @@ impl Session {
         if url.is_empty() {
             return None;
         }
-        let dir = dirs::cache_dir()
-            .unwrap_or_else(std::env::temp_dir)
-            .join("sodam")
-            .join("covers")
-            .join("original");
+        let dir = crate::audio::cover_cache_dir().join("original");
         std::fs::create_dir_all(&dir).ok()?;
         let path = dir.join(format!("{:016x}.img", hash_url(url)));
         if std::fs::metadata(&path)
@@ -463,20 +467,14 @@ impl Session {
 
     /// 删除某张缩略图封面缓存；重试时用。
     pub fn invalidate_cover_path(&self, url: &str) -> bool {
-        let path = dirs::cache_dir()
-            .unwrap_or_else(std::env::temp_dir)
-            .join("sodam")
-            .join("covers")
+        let path = crate::audio::cover_cache_dir()
             .join(format!("{:016x}-{COVER_MAX_EDGE}.img", hash_url(url)));
         std::fs::remove_file(path).is_ok()
     }
 
     /// 删除某张原图封面缓存；重试时用。
     pub fn invalidate_original_cover(&self, url: &str) -> bool {
-        let path = dirs::cache_dir()
-            .unwrap_or_else(std::env::temp_dir)
-            .join("sodam")
-            .join("covers")
+        let path = crate::audio::cover_cache_dir()
             .join("original")
             .join(format!("{:016x}.img", hash_url(url)));
         std::fs::remove_file(path).is_ok()
@@ -487,10 +485,7 @@ impl Session {
         if url.is_empty() {
             return None;
         }
-        let dir = dirs::cache_dir()
-            .unwrap_or_else(std::env::temp_dir)
-            .join("sodam")
-            .join("covers");
+        let dir = crate::audio::cover_cache_dir();
         std::fs::create_dir_all(&dir).ok()?;
         // 文件名带目标边长：换尺寸/旧的全尺寸缓存不会混用
         let path = dir.join(format!("{:016x}-{COVER_MAX_EDGE}.img", hash_url(url)));

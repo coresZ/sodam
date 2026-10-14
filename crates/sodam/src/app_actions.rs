@@ -198,6 +198,8 @@ impl Root {
                 if root.prefetch_patrol % 25 == 0 {
                     root.spawn_prefetch(cx);
                 }
+                // 下载：消费完成 / 失败事件 + 刷新面板快照（版本号变了才重克隆）
+                root.sync_downloads(cx);
                 root.load_more_recommendation(cx);
             });
         })
@@ -2002,6 +2004,7 @@ impl Root {
     #[allow(dead_code)] // 设置表单（roadmap 第 3 项）接入后由保存按钮调用
     pub fn apply_settings(&mut self, settings: Settings) {
         let reporter_settings = settings.clone();
+        let download_settings = settings.download.clone();
         match self
             .session
             .as_mut()
@@ -2018,6 +2021,11 @@ impl Root {
             }
         }
         self.play_reporter.apply_settings(reporter_settings);
+        // 下载管理器持有的是设置快照：换账号 / 改音质后必须同步，
+        // 否则队列里新排的任务还会用旧的 Cookie 去取流。
+        self.downloads.set_settings(self.settings.clone());
+        self.downloads.set_download_settings(download_settings);
+        self.download_settings_fingerprint = self.settings.fingerprint();
     }
 }
 

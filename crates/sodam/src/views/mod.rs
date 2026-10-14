@@ -14,6 +14,7 @@ use crate::ui::theme;
 use crate::ui::theme::ThemeKind;
 
 pub use login::login_modal;
+pub mod downloads;
 pub mod login;
 pub mod lyrics;
 pub mod scenes;
@@ -483,6 +484,8 @@ pub(crate) fn scrolling_detail_page(
     let cover_path = root.cover_of(&cover_url);
     let play_tracks = tracks.clone();
     let shuffle_tracks = tracks.clone();
+    let download_tracks = tracks.clone();
+    let download_source = title.clone();
     let row_tracks = tracks.clone();
     let current_track_id = root.queue.current().map(|track| track.id.clone());
     let cols = columns_for(root.list_width.lock().map(|width| *width).unwrap_or(1200.0));
@@ -602,7 +605,44 @@ pub(crate) fn scrolling_detail_page(
                                                 .size(px(theme::ICON))
                                                 .text_color(theme::text()),
                                         ),
-                                ),
+                                )
+                                .child({
+                                    // 下载全部：把整张歌单 / 专辑排进下载队列（去重后只排新的）
+                                    let tracks = download_tracks.clone();
+                                    let source = download_source.clone();
+                                    let entity = entity.clone();
+                                    div()
+                                        .id("detail-download-all")
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .gap(px(theme::space::SM))
+                                        .h(px(theme::size::CONTROL))
+                                        .px(px(theme::space::LG))
+                                        .rounded(px(theme::radius::PILL))
+                                        .bg(theme::surface_elevated())
+                                        .cursor_pointer()
+                                        .hover(|style| style.bg(theme::surface_hover()))
+                                        .on_click(move |_event: &ClickEvent, _window, cx| {
+                                            let tracks = tracks.as_ref().clone();
+                                            let source = source.clone();
+                                            entity.update(cx, |root, cx| {
+                                                root.download_tracks(tracks, source, cx);
+                                            });
+                                        })
+                                        .child(
+                                            svg()
+                                                .path(icons::path("download"))
+                                                .size(px(theme::ICON))
+                                                .text_color(theme::text()),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_size(theme::Text::Small.size())
+                                                .text_color(theme::text())
+                                                .child(language.text("下载全部")),
+                                        )
+                                }),
                         ),
                 )
                 .into_any_element();
@@ -927,12 +967,16 @@ fn playlist_grid(root: &Root, cx: &mut Context<Root>) -> AnyElement {
         .into_any_element()
 }
 
-/// 歌曲行右键菜单：锚在鼠标位置，目前提供「下一首播放」。
+/// 歌曲行右键菜单：锚在鼠标位置。
+///
+/// 目前提供「下一首播放」与「下载」（下载完成后自动打开所在文件夹，
+/// 与官方客户端右键下载的行为一致）。
 pub fn track_menu(root: &Root, cx: &mut Context<Root>) -> AnyElement {
     let Some(menu) = &root.track_menu else {
         return div().into_any_element();
     };
     let menu_track = menu.track.clone();
+    let download_track = menu.track.clone();
 
     gpui::deferred(
         gpui::anchored()
@@ -986,6 +1030,33 @@ pub fn track_menu(root: &Root, cx: &mut Context<Root>) -> AnyElement {
                                     .text_color(theme::text_muted()),
                             )
                             .child(root.tr("下一首播放")),
+                    )
+                    .child(
+                        div()
+                            .id("track-download")
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(theme::space::SM))
+                            .px(px(theme::space::SM))
+                            .py(px(theme::space::XS))
+                            .rounded(px(theme::radius::ROW))
+                            .cursor_pointer()
+                            .hover(|style| style.bg(theme::surface_hover()))
+                            .text_size(theme::Text::Small.size())
+                            .text_color(theme::text())
+                            .on_click(cx.listener(move |root, _event: &ClickEvent, _window, cx| {
+                                let track = download_track.clone();
+                                root.track_menu = None;
+                                root.download_track(track, true, cx);
+                            }))
+                            .child(
+                                svg()
+                                    .path(icons::path("download"))
+                                    .size(px(theme::ICON_SM))
+                                    .text_color(theme::text_muted()),
+                            )
+                            .child(root.tr("下载")),
                     ),
             ),
     )

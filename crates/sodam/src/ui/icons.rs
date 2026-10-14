@@ -132,6 +132,8 @@ icon_set!(
     "square",
     "disc-3",
     "check",
+    "download",
+    "folder-open",
 );
 
 /// 听歌模式内置图标路径。

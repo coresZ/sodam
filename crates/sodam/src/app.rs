@@ -2,6 +2,8 @@
 
 #[path = "app_actions.rs"]
 mod actions;
+#[path = "app_download.rs"]
+mod download_actions;
 #[path = "app_search.rs"]
 mod search_actions;
 
@@ -20,6 +22,8 @@ use sodam_core::{
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+
+use sodam_core::download::{DownloadCounts, DownloadManager, DownloadTask};
 
 /// 封面请求池：有界并发 + 去重 + 队列上限。
 ///
@@ -355,6 +359,51 @@ pub struct Root {
     pub engine: PlaybackEngine,
     /// 播放进度 / 时长上报（喂引擎快照，内部异步发请求）。
     pub play_reporter: PlayReporter,
+    /// 下载管理器（队列 / 并发 / 状态机全在 sodam-core）。
+    pub downloads: DownloadManager,
+    /// 下载面板是否展开（与队列抽屉互斥）。
+    pub download_open: bool,
+    /// 下载面板当前分区。
+    pub download_tab: DownloadTab,
+    /// 任务快照缓存：`(revision, tasks)`，渲染只读它，避免每帧深拷贝整个队列。
+    pub download_cache: (u64, Arc<Vec<DownloadTask>>),
+    /// 任务统计快照（侧栏徽章 / 分区标签）。
+    pub download_counts: DownloadCounts,
+    /// 上次推给下载管理器的设置指纹（避免每帧深拷贝 Settings）。
+    pub(crate) download_settings_fingerprint: u64,
+}
+
+/// 下载面板的分区。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DownloadTab {
+    #[default]
+    Active,
+    Completed,
+    Failed,
+}
+
+impl DownloadTab {
+    pub const ALL: [DownloadTab; 3] = [
+        DownloadTab::Active,
+        DownloadTab::Completed,
+        DownloadTab::Failed,
+    ];
+
+    pub fn label(self, language: Language) -> &'static str {
+        match self {
+            DownloadTab::Active => language.text("进行中"),
+            DownloadTab::Completed => language.text("已完成"),
+            DownloadTab::Failed => language.text("失败"),
+        }
+    }
+
+    pub fn matches(self, state: &sodam_core::download::DownloadState) -> bool {
+        match self {
+            DownloadTab::Active => state.is_active(),
+            DownloadTab::Completed => state.is_finished(),
+            DownloadTab::Failed => state.is_failed(),
+        }
+    }
 }
 
 impl Root {
@@ -393,6 +442,8 @@ impl Root {
 
         let logged_in = !settings.cookie.trim().is_empty();
         let play_reporter = PlayReporter::new(settings.clone());
+        let downloads = DownloadManager::new(settings.clone());
+        downloads.set_download_settings(settings.download.clone());
         let mut root = Self {
             // 未登录只能待在设置页（登录入口在设置 → 账户）
             nav: if logged_in {
@@ -524,6 +575,12 @@ impl Root {
             account: None,
             engine: PlaybackEngine::new(),
             play_reporter,
+            downloads,
+            download_open: false,
+            download_tab: DownloadTab::default(),
+            download_cache: (u64::MAX, Arc::new(Vec::new())),
+            download_counts: DownloadCounts::default(),
+            download_settings_fingerprint: 0,
         };
         if logged_in {
             root.refresh_account(cx);
@@ -942,6 +999,9 @@ impl Render for Root {
                     )
                     .when(self.queue_open && self.nav != Nav::Lyrics, |this| {
                         this.child(ui::player_bar::queue_drawer(self, cx))
+                    })
+                    .when(self.download_open, |this| {
+                        this.child(views::downloads::panel(self, cx))
                     }),
             )
             .child(ui::player_bar::render(self, cx))

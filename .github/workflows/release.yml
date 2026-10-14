@@ -96,7 +96,7 @@ jobs:
           retention-days: 7
 
   windows-package:
-    name: Windows x64 installer
+    name: Windows x64
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
@@ -124,7 +124,21 @@ jobs:
           $hash = (Get-FileHash $setup -Algorithm SHA256).Hash.ToLower()
           "$hash  $(Split-Path $setup -Leaf)" | Out-File -FilePath "$setup.sha256" -Encoding ascii
 
-      - name: Upload installer artifact
+      # 便携版：与安装包同一个 exe，zip 里多一个 portable.txt 标记文件。
+      # 有标记时配置 / 缓存 / 下载全部落在程序目录（见 sodam-core/src/paths.rs）。
+      - name: Create Windows portable zip
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"' |
+            Select-Object -First 1).Matches.Groups[1].Value
+          & packaging/windows/make-portable-zip.ps1 -Version $version -OutputDir release
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $zip = "release/sodam-$version-windows-x64-portable.zip"
+          if (-not (Test-Path $zip)) { throw "portable zip not found: $zip" }
+          if (-not (Test-Path "$zip.sha256")) { throw "portable checksum not found: $zip.sha256" }
+          Write-Output "portable zip: $zip ($((Get-Item $zip).Length) bytes)"
+
+      - name: Upload Windows artifacts
         uses: actions/upload-artifact@v4
         with:
           name: sodam-windows-x64
@@ -192,8 +206,9 @@ jobs:
             macOS (Apple Silicon, unsigned / ad-hoc signed):
             - `aarch64` `.app` zip，首次打开见 README「macOS 下载安装」
 
-            Windows (x64 installer, per-user):
-            - `windows-x64` 安装包，双击安装，见 README「Windows 下载安装」
+            Windows (x64):
+            - `windows-x64-setup.exe` 安装包，双击安装，见 README「Windows 下载安装」
+            - `windows-x64-portable.zip` 便携版，解压到任意目录即可运行；配置 / 缓存 / 下载都留在解压出来的目录里，见 README「Windows 便携版」
 
             - `SHA256SUMS`
           files: |

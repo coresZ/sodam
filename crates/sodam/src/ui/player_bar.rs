@@ -570,12 +570,45 @@ pub fn render(root: &Root, cx: &mut Context<Root>) -> impl IntoElement {
                     )),
                 )
                 .child(volume_slider(root, cx))
+                .child({
+                    // 下载入口：有任务在跑时图标带强调色，一眼能看出后台在工作。
+                    let active = root.download_counts.active();
+                    let color = if active > 0 {
+                        theme::accent()
+                    } else {
+                        theme::text_muted()
+                    };
+                    let button = icon_button("downloads", "download", theme::ICON, color).on_click(
+                        cx.listener(|root, _event: &ClickEvent, _window, cx| {
+                            root.toggle_downloads(cx);
+                        }),
+                    );
+                    if active > 0 {
+                        button
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .ml(px(-2.0))
+                                    .px(px(theme::space::XS))
+                                    .rounded(px(theme::radius::PILL))
+                                    .bg(theme::accent_soft())
+                                    .text_size(theme::Text::Tiny.size())
+                                    .text_color(theme::accent())
+                                    .child(active.to_string()),
+                            )
+                            .into_any_element()
+                    } else {
+                        button.into_any_element()
+                    }
+                })
                 .child(
                     icon_button("queue", "list-end", theme::ICON, theme::text_muted()).on_click(
                         cx.listener(|root, _event: &ClickEvent, _window, cx| {
                             root.queue_open = !root.queue_open;
                             if root.queue_open {
-                                // 打开时把滚动位置锚到「正在播放」
+                                // 打开时把滚动位置锚到「正在播放」；
+                                // 同时收起下载面板（右侧只留一个面板）。
+                                root.download_open = false;
                                 root.anchor_queue_scroll();
                             }
                             cx.notify();
