@@ -760,7 +760,7 @@ fn setting_row(label: String, hint: String, control: AnyElement) -> AnyElement {
 }
 
 /// 分段选择器（音质 / 并发数 / 已存在策略都用它）。
-fn segmented<T: Clone + PartialEq + 'static>(
+pub(crate) fn segmented<T: Clone + PartialEq + 'static>(
     id_prefix: &'static str,
     options: Vec<(T, String)>,
     current: &T,

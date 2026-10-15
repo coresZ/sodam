@@ -12,7 +12,7 @@
 //! 「继续」从头重下。CDN 是否支持 Range 续传无法保证，与其留下不可靠的断点，
 //! 不如让状态机保持简单可预测。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use crate::config::Settings;
+use crate::download_library::LibraryEntry;
 use crate::models::{LyricLine, TrackItem};
 use crate::session::Session;
 
@@ -39,6 +40,13 @@ const FALLBACK_STEM: &str = "未知曲目";
 const MAX_SEGMENT_CHARS: usize = 80;
 /// 下载文件认识的音频扩展名（探测已存在文件 / 决定容器后缀）。
 const AUDIO_EXTENSIONS: &[&str] = &["m4a", "mp4", "flac", "mp3", "wav", "aac"];
+/// 封面旁路子目录（`<下载根>/image/`）。
+///
+/// 旁路固定落在**下载根**的子目录里，不跟随命名模板的 `/` 分层 ——
+/// 音乐库软件（foobar2000 / MusicBee 等）默认就往这两个目录找图与词。
+const SIDECAR_IMAGE_DIR: &str = "image";
+/// 歌词旁路子目录（`<下载根>/lrc/`）。
+const SIDECAR_LRC_DIR: &str = "lrc";
 /// 下载并发上限（设置页只给 1~3，这里再兜一层）。
 const MAX_CONCURRENT: u8 = 3;
 /// 单次自动重试之间的退避基数。
@@ -58,9 +66,9 @@ pub struct DownloadSettings {
     pub dir: String,
     /// 文件命名模板，支持 `{artist}` / `{title}` / `{album}` 占位符与 `/` 分层。
     pub naming: String,
-    /// 是否写同目录封面图（旁路图片文件）。
+    /// 是否写封面图（旁路图片，落 `<下载根>/image/`）。
     pub write_cover: bool,
-    /// 是否写同目录歌词（旁路 `.lrc`）。
+    /// 是否写歌词（旁路 `.lrc`，落 `<下载根>/lrc/`）。
     pub write_lyrics: bool,
     /// 同时下载数（1~3）。
     pub concurrent: u8,
@@ -271,6 +279,220 @@ fn existing_file(base: &Path) -> Option<PathBuf> {
     None
 }
 
+/// 扫到的一个本地音频文件。
+#[derive(Clone, Debug, PartialEq)]
+pub struct ScannedFile {
+    /// 相对根目录、**不含扩展名**（与 `render_relative_path`、清单主键同源）。
+    pub relative: PathBuf,
+    /// 实际扩展名（`m4a` / `mp4` / `flac` …）。
+    pub extension: String,
+    pub bytes: u64,
+    /// 文件 mtime（unix 秒）；取不到为 `None`。
+    pub modified: Option<i64>,
+    /// 容器头探测出的时长（秒）；取不到为 `None`。
+    ///
+    /// 只在**清单里没有该条目、或清单条目缺时长**时探测 —— 有权威值时不必读盘。
+    pub duration_seconds: Option<f64>,
+}
+
+/// 扫描下载目录里的音频文件，带大小与 mtime。
+///
+/// 判定规则与 [`existing_file`] 完全一致：扩展名属于 [`AUDIO_EXTENSIONS`] 且文件非空。
+/// 调用方用 [`render_relative_path`] 算出目标相对路径后做比对，得到的正是
+/// 「点下载会不会说"已存在"」这一语义 —— 界面标记与跳过逻辑因此不可能自相矛盾。
+///
+/// * **递归**：命名模板允许 `/` 分层，音频可能在任何深度；
+/// * **不跟进符号链接 / 目录联接**：避免自引用把扫描绕死，另有深度上限兜底；
+/// * `image/` / `lrc/` 里的图片与歌词不是音频扩展名，天然被排除；
+/// * 目录不存在时返回空列表（一次都没下载过是常态，不是错误）；
+/// * 结果按 mtime **倒序**（新的在前），mtime 取不到时按相对路径 —— 顺序稳定，
+///   列表可以直接渲染。
+///
+/// 纯文件系统操作，**必须在后台线程调用**（见 `AGENTS.md` 第 2 条）。
+///
+/// 时长探测按需进行：`known_durations` 里已有的（来自清单）不重复读盘。
+pub fn scan_local_files(
+    settings: &DownloadSettings,
+    known_durations: &std::collections::HashMap<PathBuf, f64>,
+) -> Vec<ScannedFile> {
+    let root = settings.resolve_dir();
+    let mut found = Vec::new();
+    walk_audio(&root, &root, 0, &mut found, known_durations);
+    found.sort_by(|left, right| {
+        right
+            .modified
+            .cmp(&left.modified)
+            .then_with(|| left.relative.cmp(&right.relative))
+    });
+    found
+}
+
+/// 同上，但不探测时长（「已下载」标记这类只看存在性的调用方用）。
+pub fn scan_local_files_fast(settings: &DownloadSettings) -> Vec<ScannedFile> {
+    scan_local_files(settings, &std::collections::HashMap::new())
+}
+
+/// 「存在与否」的轻量视图：与 [`scan_local_files`] 同一次判定，只取相对路径。
+///
+/// 「已下载」标记与清单校验只需要这个；要展示大小 / 时间就用完整版
+/// （一次目录遍历同时喂给两者，别扫两遍）。
+pub fn scan_downloaded(settings: &DownloadSettings) -> HashSet<PathBuf> {
+    scan_local_files_fast(settings)
+        .into_iter()
+        .map(|file| file.relative)
+        .collect()
+}
+
+/// 扫描深度上限：模板分层是人写的，不会有这么深；纯粹防御异常目录树。
+const SCAN_MAX_DEPTH: usize = 16;
+
+/// 旁路封面候选扩展名（写侧用魔数嗅探，扩展名不固定）。
+const SIDECAR_IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "webp"];
+
+/// 扫到的旁路文件：按**文件名 stem** 索引（旁路不跟随模板分层，见模块内说明）。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ScannedSidecars {
+    /// 文件名 stem → 封面绝对路径。
+    pub covers: std::collections::HashMap<String, PathBuf>,
+    /// 文件名 stem → 歌词绝对路径。
+    pub lyrics: std::collections::HashMap<String, PathBuf>,
+}
+
+/// 扫描 `<下载根>/image/` 与 `<下载根>/lrc/`。
+///
+/// 与音频扫描分开：旁路目录是**扁平**的（不跟随命名模板分层），
+/// 两个 `read_dir` 就够，成本极低。
+///
+/// 键用**文件名 stem**（不含扩展名）：音频的 `relative` 可能带模板子目录，
+/// 但旁路永远落在根目录 —— 这是既有设计的必然结果（见 `MODIFICATIONS.md`）。
+///
+/// 纯文件系统操作，**必须在后台线程调用**。
+pub fn scan_sidecars(settings: &DownloadSettings) -> ScannedSidecars {
+    let root = settings.resolve_dir();
+    let mut sidecars = ScannedSidecars::default();
+
+    if let Ok(entries) = std::fs::read_dir(root.join(SIDECAR_IMAGE_DIR)) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|value| value.to_str()) else {
+                continue;
+            };
+            let Some(extension) = path.extension().and_then(|value| value.to_str()) else {
+                continue;
+            };
+            if !SIDECAR_IMAGE_EXTENSIONS
+                .iter()
+                .any(|known| extension.eq_ignore_ascii_case(known))
+            {
+                continue;
+            }
+            // 同名多扩展名时先到先得（正常只会有一个）。
+            sidecars.covers.entry(stem.to_string()).or_insert(path);
+        }
+    }
+
+    if let Ok(entries) = std::fs::read_dir(root.join(SIDECAR_LRC_DIR)) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|value| value.to_str()) else {
+                continue;
+            };
+            let Some(extension) = path.extension().and_then(|value| value.to_str()) else {
+                continue;
+            };
+            if !extension.eq_ignore_ascii_case("lrc") {
+                continue;
+            }
+            sidecars.lyrics.entry(stem.to_string()).or_insert(path);
+        }
+    }
+
+    sidecars
+}
+
+/// 读一份旁路 `.lrc` 并解析成歌词行（复用网络歌词同一套解析器）。
+pub fn read_sidecar_lyrics(path: &Path) -> Option<Vec<crate::models::LyricLine>> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let lines = crate::models::parse_lrc(&text);
+    (!lines.is_empty()).then_some(lines)
+}
+
+fn walk_audio(
+    root: &Path,
+    dir: &Path,
+    depth: usize,
+    found: &mut Vec<ScannedFile>,
+    known_durations: &std::collections::HashMap<PathBuf, f64>,
+) {
+    if depth > SCAN_MAX_DEPTH {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        // 符号链接与目录联接一律不跟进：自引用会绕成死循环。
+        if file_type.is_symlink() {
+            continue;
+        }
+        let path = entry.path();
+        if file_type.is_dir() {
+            walk_audio(root, &path, depth + 1, found, known_durations);
+            continue;
+        }
+        if !file_type.is_file() {
+            continue;
+        }
+        let Some(extension) = path.extension().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if !AUDIO_EXTENSIONS
+            .iter()
+            .any(|known| extension.eq_ignore_ascii_case(known))
+        {
+            continue;
+        }
+        // 一次 stat 同时拿到大小与 mtime。
+        let Ok(meta) = std::fs::metadata(&path) else {
+            continue;
+        };
+        // 空文件不算成品：与 `existing_file` 同规则，被截断的半截文件不冒充已下载。
+        if meta.len() == 0 {
+            continue;
+        }
+        let Ok(relative) = path.strip_prefix(root) else {
+            continue;
+        };
+        let relative = relative.with_extension("");
+        // 时长：清单里已有就不读盘；否则探测（MP4 走快速 mvhd 路径）。
+        let duration_seconds = match known_durations.get(&relative).copied() {
+            Some(seconds) if seconds > 0.0 => Some(seconds),
+            _ => crate::audio::probe_duration(&path),
+        };
+        found.push(ScannedFile {
+            // 去掉扩展名，与 `render_relative_path` 的返回值对齐。
+            relative,
+            extension: extension.to_string(),
+            bytes: meta.len(),
+            modified: meta
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|delta| delta.as_secs() as i64),
+            duration_seconds,
+        });
+    }
+}
+
 /// 源格式 → 落盘扩展名（不认识时按 m4a 处理，与播放缓存一致）。
 fn format_extension(info: &libresoda::soda::types::DownloadInfo) -> &'static str {
     let format = info.format.trim().to_ascii_lowercase();
@@ -464,13 +686,13 @@ pub fn download_track(
     };
     // 旁路元数据是「加分项」：失败不影响下载本身，只留调试日志。
     if download.write_cover {
-        outcome.cover = write_cover_sidecar(&session, track, &path);
+        outcome.cover = write_cover_sidecar(&session, track, &dir, &path);
         if outcome.cover.is_none() {
             log_sidecar("封面", &track.title);
         }
     }
     if download.write_lyrics {
-        outcome.lyrics = write_lyrics_sidecar(&session, track, &path);
+        outcome.lyrics = write_lyrics_sidecar(&session, track, &dir, &path);
         if outcome.lyrics.is_none() {
             log_sidecar("歌词", &track.title);
         }
@@ -592,8 +814,24 @@ fn image_extension(bytes: &[u8]) -> &'static str {
     }
 }
 
-/// 写同目录封面。失败返回 `None`。
-fn write_cover_sidecar(session: &Session, track: &TrackItem, audio: &Path) -> Option<PathBuf> {
+/// 旁路文件目标路径：`<下载根>/<子目录>/<音频文件名>.<扩展名>`。
+///
+/// 只替换最后一段扩展名（`set_extension`），所以歌名里本来就有的点号
+/// （`A - B 1.5`）不会被截断。音频可以按模板 `/` 分层，旁路不跟。
+fn sidecar_path(root: &Path, audio: &Path, subdir: &str, extension: &str) -> Option<PathBuf> {
+    let name = audio.file_name()?;
+    let mut target = root.join(subdir).join(name);
+    target.set_extension(extension);
+    Some(target)
+}
+
+/// 写封面旁路（`<下载根>/image/`）。失败返回 `None`。
+fn write_cover_sidecar(
+    session: &Session,
+    track: &TrackItem,
+    root: &Path,
+    audio: &Path,
+) -> Option<PathBuf> {
     if track.cover.trim().is_empty() {
         return None;
     }
@@ -602,18 +840,26 @@ fn write_cover_sidecar(session: &Session, track: &TrackItem, audio: &Path) -> Op
     if bytes.is_empty() {
         return None;
     }
-    let target = audio.with_extension(image_extension(&bytes));
+    let target = sidecar_path(root, audio, SIDECAR_IMAGE_DIR, image_extension(&bytes))?;
+    // 新布局比音频多一层目录，不能再指望音频的父目录已经建好。
+    std::fs::create_dir_all(target.parent()?).ok()?;
     std::fs::write(&target, bytes).ok()?;
     Some(target)
 }
 
-/// 写同目录歌词（`.lrc`）。失败返回 `None`。
-fn write_lyrics_sidecar(session: &Session, track: &TrackItem, audio: &Path) -> Option<PathBuf> {
+/// 写歌词旁路（`<下载根>/lrc/`）。失败返回 `None`。
+fn write_lyrics_sidecar(
+    session: &Session,
+    track: &TrackItem,
+    root: &Path,
+    audio: &Path,
+) -> Option<PathBuf> {
     let lines = session.lyrics(track).ok()?;
     if lines.is_empty() {
         return None;
     }
-    let target = audio.with_extension("lrc");
+    let target = sidecar_path(root, audio, SIDECAR_LRC_DIR, "lrc")?;
+    std::fs::create_dir_all(target.parent()?).ok()?;
     std::fs::write(&target, lyrics_to_lrc(&lines)).ok()?;
     Some(target)
 }
@@ -1270,6 +1516,7 @@ fn run_task(shared: Arc<Shared>, id: u64, base: Settings, download: DownloadSett
         result,
         last_failure,
         flags.stop.load(Ordering::Relaxed),
+        &download,
     );
 }
 
@@ -1332,9 +1579,12 @@ fn finish_task(
     result: Option<TrackDownloadOutcome>,
     failure: Option<DownloadFailure>,
     stopped: bool,
+    download: &DownloadSettings,
 ) {
     let mut completed = None;
     let mut failed = None;
+    // 清单写入要落盘，**必须放在状态锁外面做**（占着任务锁做 I/O 会拖住调度器与 UI）。
+    let mut entry: Option<LibraryEntry> = None;
     {
         let Ok(mut state) = shared.state.lock() else {
             return;
@@ -1353,6 +1603,23 @@ fn finish_task(
                     skipped: outcome.skipped,
                 };
                 task.finished_at = Some(Instant::now());
+                // 「本地音乐」页跨重启的依据。
+                // 文件本就在（按策略跳过）也记一条 —— 老版本留下的文件借此补进清单，
+                // 但那种情况下质量未知，留空而不是把「已存在」当成音质写进去。
+                let extension = outcome
+                    .path
+                    .extension()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or_default()
+                    .to_string();
+                entry = Some(LibraryEntry::from_download(
+                    &task.track,
+                    render_relative_path(download.naming(), &task.track),
+                    &extension,
+                    outcome.bytes,
+                    (!outcome.skipped).then_some(outcome.quality.as_str()),
+                    &outcome.path,
+                ));
                 if !outcome.skipped {
                     completed = Some(DownloadEvent::Completed {
                         title: task.track.title.clone(),
@@ -1383,6 +1650,14 @@ fn finish_task(
                         error: failure.message,
                     });
                 }
+            }
+        }
+    }
+    // 清单写入失败不影响下载本身（与封面 / 歌词旁路的处理一致）。
+    if let Some(entry) = entry {
+        if let Err(err) = crate::download_library::upsert(download, entry) {
+            if std::env::var("SODAM_DOWNLOAD_LOG").is_ok() {
+                eprintln!("[download] 写入本地音乐清单失败：{err}");
             }
         }
     }
@@ -1585,6 +1860,121 @@ mod tests {
     }
 
     #[test]
+    fn sidecar_paths_land_in_root_subdirs() {
+        let root = PathBuf::from("D:/music/SodaM");
+        let audio = root.join("Artist - Title.flac");
+
+        let cover = sidecar_path(&root, &audio, SIDECAR_IMAGE_DIR, "png").expect("cover");
+        assert_eq!(cover, root.join("image").join("Artist - Title.png"));
+
+        let lyrics = sidecar_path(&root, &audio, SIDECAR_LRC_DIR, "lrc").expect("lyrics");
+        assert_eq!(lyrics, root.join("lrc").join("Artist - Title.lrc"));
+
+        // 音频按命名模板分了子目录时，旁路仍然固定在下载根，不跟随分层
+        let nested = root.join("某专辑").join("Artist - Title.flac");
+        let nested_lyrics = sidecar_path(&root, &nested, SIDECAR_LRC_DIR, "lrc").expect("lyrics");
+        assert_eq!(nested_lyrics, root.join("lrc").join("Artist - Title.lrc"));
+        assert!(!nested_lyrics.to_string_lossy().contains("某专辑"));
+
+        // 歌名里本来就有点号时，只替换真正的音频扩展名
+        let dotted = root.join("A - B 1.5.m4a");
+        let dotted_cover = sidecar_path(&root, &dotted, SIDECAR_IMAGE_DIR, "jpg").expect("cover");
+        assert_eq!(dotted_cover, root.join("image").join("A - B 1.5.jpg"));
+    }
+
+    #[test]
+    fn scan_downloaded_agrees_with_the_skip_semantics() {
+        let root = std::env::temp_dir().join(format!("sodam-scan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("某专辑")).expect("mkdir");
+        std::fs::create_dir_all(root.join(SIDECAR_IMAGE_DIR)).expect("mkdir");
+        std::fs::create_dir_all(root.join(SIDECAR_LRC_DIR)).expect("mkdir");
+
+        // 认得的音频：根目录一个、模板分层目录一个
+        std::fs::write(root.join("Artist - Title.m4a"), b"x").expect("write");
+        std::fs::write(root.join("某专辑").join("A - B.flac"), b"x").expect("write");
+        // 空文件不算（与 existing_file 同规则）
+        std::fs::write(root.join("Empty.m4a"), []).expect("write");
+        // 旁路与非音频不算
+        std::fs::write(
+            root.join(SIDECAR_IMAGE_DIR).join("Artist - Title.png"),
+            b"x",
+        )
+        .expect("write");
+        std::fs::write(root.join(SIDECAR_LRC_DIR).join("Artist - Title.lrc"), b"x").expect("write");
+        std::fs::write(root.join("notes.txt"), b"x").expect("write");
+
+        let settings = DownloadSettings {
+            dir: root.to_string_lossy().to_string(),
+            ..Default::default()
+        };
+        let found = scan_downloaded(&settings);
+
+        assert!(
+            found.contains(&PathBuf::from("Artist - Title")),
+            "{found:?}"
+        );
+        assert!(
+            found.contains(&PathBuf::from("某专辑").join("A - B")),
+            "{found:?}"
+        );
+        assert!(
+            !found.contains(&PathBuf::from("Empty")),
+            "空文件不该算已下载"
+        );
+        assert!(
+            !found.contains(&PathBuf::from("notes")),
+            "非音频不该算已下载"
+        );
+        assert_eq!(found.len(), 2, "{found:?}");
+
+        // 关键不变式：render_relative_path 的输出能直接拿来查这个集合
+        let track = track("Artist", "Title");
+        let expected = render_relative_path(settings.naming(), &track);
+        assert!(found.contains(&expected), "{expected:?} 应命中");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn scan_local_files_reports_extension_size_and_mtime() {
+        let root = std::env::temp_dir().join(format!("sodam-scan-files-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("某专辑")).expect("mkdir");
+        std::fs::write(root.join("A.m4a"), b"1234").expect("write");
+        std::fs::write(root.join("某专辑").join("B.flac"), b"12").expect("write");
+
+        let settings = DownloadSettings {
+            dir: root.to_string_lossy().to_string(),
+            ..Default::default()
+        };
+        let files = scan_local_files_fast(&settings);
+        assert_eq!(files.len(), 2, "{files:?}");
+
+        let a = files
+            .iter()
+            .find(|file| file.relative.as_path() == Path::new("A"))
+            .expect("A 应在结果里");
+        assert_eq!(a.extension, "m4a");
+        assert_eq!(a.bytes, 4);
+        assert!(a.modified.is_some(), "本地音乐列表需要 mtime");
+
+        let b = files
+            .iter()
+            .find(|file| file.relative == PathBuf::from("某专辑").join("B"))
+            .expect("分层目录里的 B 应在结果里");
+        assert_eq!(b.extension, "flac");
+        assert_eq!(b.bytes, 2);
+
+        // 轻量版必须与完整版看到同一批文件（否则标记与列表会自相矛盾）
+        let light = scan_downloaded(&settings);
+        assert_eq!(light.len(), files.len());
+        assert!(light.contains(&PathBuf::from("A")));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn image_extension_sniffs_magic() {
         assert_eq!(image_extension(&[0x89, b'P', b'N', b'G', 0x0D]), "png");
         assert_eq!(image_extension(&[0xFF, 0xD8, 0xFF]), "jpg");
@@ -1616,6 +2006,131 @@ mod tests {
         assert_eq!(format_extension(&info("mp3")), "mp3");
         assert_eq!(format_extension(&info("")), "m4a");
         assert_eq!(format_extension(&info("weird")), "m4a");
+    }
+
+    #[test]
+    fn finishing_a_download_writes_the_library_manifest() {
+        // 「重启不再丢」的命门：下载完成必须落一条清单，且能还原成可重下的记录。
+        let dir = std::env::temp_dir().join(format!("sodam-dl-manifest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+
+        let download = DownloadSettings {
+            dir: dir.display().to_string(),
+            ..Default::default()
+        };
+        let shared = Arc::new(Shared {
+            state: Mutex::new(State {
+                tasks: Vec::new(),
+                next_id: 3,
+                paused_all: false,
+            }),
+            settings: Mutex::new(Settings::default()),
+            download: Mutex::new(download.clone()),
+            flags: Mutex::new(BTreeMap::new()),
+            events: Mutex::new(Vec::new()),
+            revision: AtomicU64::new(0),
+            fingerprint: AtomicU64::new(0),
+        });
+
+        let first = track("歌手", "晴天");
+        let relative = render_relative_path(download.naming(), &first);
+        let path = dir.join(relative.clone()).with_extension("m4a");
+        std::fs::write(&path, b"audio").expect("write");
+        shared.state.lock().expect("lock").tasks.push(DownloadTask {
+            id: 1,
+            track: first,
+            quality: "lossless".into(),
+            source: String::new(),
+            open_when_done: false,
+            state: DownloadState::Running {
+                downloaded: 5,
+                total: Some(5),
+                speed: 0.0,
+            },
+            created_at: Instant::now(),
+            finished_at: None,
+            attempts: 1,
+        });
+
+        finish_task(
+            &shared,
+            1,
+            Some(TrackDownloadOutcome {
+                path: path.clone(),
+                bytes: 5,
+                quality: "无损 871k".into(),
+                skipped: false,
+                cover: None,
+                lyrics: None,
+            }),
+            None,
+            false,
+            &download,
+        );
+
+        let entries = crate::download_library::load(&download);
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0].relative, relative);
+        assert_eq!(entries[0].bytes, 5);
+        assert_eq!(entries[0].quality.as_deref(), Some("无损 871k"));
+        assert_eq!(entries[0].title.as_deref(), Some("晴天"));
+        assert!(
+            entries[0].to_track().is_some(),
+            "下载来的条目应能还原成 TrackItem"
+        );
+
+        // 模拟重启：重新读清单 + 扫盘校验，这条应当仍在「本地音乐」里
+        let reloaded = crate::download_library::load(&download);
+        let outcome = crate::download_library::reconcile(&download, reloaded);
+        assert_eq!(outcome.present.len(), 1);
+        assert!(outcome.missing.is_empty());
+
+        // 「已存在（跳过）」也要落账（老版本留下的文件借此补进清单），
+        // 但质量是未知的 —— 不能把「已存在」当成音质写进去。
+        let second = track("歌手", "另一首");
+        let second_relative = render_relative_path(download.naming(), &second);
+        let second_path = dir.join(second_relative.clone()).with_extension("m4a");
+        std::fs::write(&second_path, b"audio").expect("write");
+        shared.state.lock().expect("lock").tasks.push(DownloadTask {
+            id: 2,
+            track: second,
+            quality: "lossless".into(),
+            source: String::new(),
+            open_when_done: false,
+            state: DownloadState::Queued,
+            created_at: Instant::now(),
+            finished_at: None,
+            attempts: 0,
+        });
+        finish_task(
+            &shared,
+            2,
+            Some(TrackDownloadOutcome {
+                path: second_path,
+                bytes: 5,
+                quality: "已存在".into(),
+                skipped: true,
+                cover: None,
+                lyrics: None,
+            }),
+            None,
+            false,
+            &download,
+        );
+
+        let entries = crate::download_library::load(&download);
+        assert_eq!(entries.len(), 2, "{entries:?}");
+        let skipped = entries
+            .iter()
+            .find(|entry| entry.relative == second_relative)
+            .expect("跳过的那条也应在清单里");
+        assert_eq!(
+            skipped.quality, None,
+            "跳过的条目质量未知，不能写「已存在」"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

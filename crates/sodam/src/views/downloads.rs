@@ -17,11 +17,9 @@ use crate::ui::{icons, theme};
 
 /// 行高（与队列抽屉一致）。
 const ROW_H: f32 = theme::size::LIST_ROW;
-/// 面板宽度：比队列抽屉略宽，进度条 + 两个操作按钮才排得下。
-const PANEL_W: f32 = 360.0;
 
 /// 字节 → 人类可读（与设置页的缓存统计同一套口径）。
-fn human_bytes(bytes: u64) -> String {
+pub(crate) fn human_bytes(bytes: u64) -> String {
     const KB: f64 = 1024.0;
     let value = bytes as f64;
     if value >= KB * KB * KB {
@@ -37,7 +35,7 @@ fn human_bytes(bytes: u64) -> String {
 
 /// 行内文案（在渲染闭包外算好，闭包只需要 `Language`，不需要整个 `Root`）。
 #[derive(Clone)]
-struct RowLabels {
+pub(crate) struct RowLabels {
     /// 状态行：百分比 · 速度 · 已下载 / 失败原因 / 完成信息。
     detail: String,
     /// 主操作按钮的图标。
@@ -60,7 +58,7 @@ enum PrimaryAction {
 }
 
 /// 把任务状态翻成渲染需要的一组值。
-fn row_labels(root: &Root, task: &DownloadTask) -> RowLabels {
+pub(crate) fn row_labels(root: &Root, task: &DownloadTask) -> RowLabels {
     let language = root.language;
     let failed = matches!(
         task.state,
@@ -135,7 +133,7 @@ fn row_labels(root: &Root, task: &DownloadTask) -> RowLabels {
 
 /// 任务行。
 #[allow(clippy::too_many_arguments)]
-fn task_row(
+pub(crate) fn task_row(
     entity: &gpui::Entity<Root>,
     task: &DownloadTask,
     labels: RowLabels,
@@ -367,8 +365,13 @@ fn footer_button(id: &'static str, label: String) -> gpui::Stateful<gpui::Div> {
         .child(label)
 }
 
-/// 渲染下载面板（主界面右侧抽屉）。
-pub fn panel(root: &Root, cx: &mut Context<Root>) -> impl IntoElement {
+/// 下载面板的设计宽度（下限）。叠加时实际宽度由调用方按视口算好传入
+/// （`app.rs::overlay_panel_width`）—— 叠加层不能用样式百分比：绝对定位层
+/// 宽度是 auto，`relative(..)` 会按元素自身宽度解析（360px × 0.4 = 144px）。
+pub(crate) const PANEL_W: f32 = 360.0;
+
+/// 渲染下载面板（主界面右侧抽屉）；`width` 由调用方按视口算成确定像素。
+pub fn panel(root: &Root, width: f32, cx: &mut Context<Root>) -> impl IntoElement {
     let language = root.language;
     let counts = root.download_counts;
     let tab = root.download_tab;
@@ -438,11 +441,13 @@ pub fn panel(root: &Root, cx: &mut Context<Root>) -> impl IntoElement {
         .flex()
         .flex_col()
         .h_full()
-        .w(px(PANEL_W))
+        // 叠加在内容之上：宽度由调用方按视口算成确定像素，加阴影与边框把层次分开。
+        .w(px(width))
         .flex_none()
         .bg(theme::bg())
         .border_l_1()
         .border_color(theme::border())
+        .shadow_lg()
         .child(
             // 工具栏：标题 + 关闭
             div()

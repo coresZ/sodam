@@ -15,6 +15,7 @@ use crate::ui::theme::ThemeKind;
 
 pub use login::login_modal;
 pub mod downloads;
+pub mod local_music;
 pub mod login;
 pub mod lyrics;
 pub mod scenes;
@@ -24,7 +25,7 @@ pub mod shortcut_card;
 use settings::duration_of;
 
 use sodam_core::library::SearchScope;
-use sodam_core::models::{AlbumItem, ArtistItem, SearchEntry};
+use sodam_core::models::{AlbumItem, ArtistItem, SearchEntry, TrackItem};
 
 /// 官方客户端那种整宽列布局：`# / 歌曲 / 歌手 / 专辑 / 时长`。
 ///
@@ -51,13 +52,77 @@ fn vip_badge() -> AnyElement {
         .into_any_element()
 }
 
+/// 「已下载」徽章：仅图标，视觉权重刻意低于 VIP 徽章与「正在播放」指示。
+///
+/// 语义严格等于「下载目录里已经有这个文件」（`download::scan_downloaded` 的判定）。
+/// **不代表播放会走本地文件或能离线播放** —— 播放用的是独立的播放缓存
+/// （`crates/sodam-core/src/session.rs` 的 `cached_track`），完全不读下载目录。
+fn download_badge() -> AnyElement {
+    svg()
+        .path(icons::path("check"))
+        .size(px(theme::ICON_SM))
+        .flex_none()
+        .text_color(theme::text_muted())
+        .into_any_element()
+}
+
+/// 播放页曲目簇里的「下载 / 已下载」槽位。
+///
+/// * 已下载 → 勾选图标（同列表行的 [`download_badge`]），不可点；
+/// * 未下载 → 下载图标，可点，点击入队下载（`open_when_done = false`）。
+///
+/// 与列表行的固定槽位同理：**槽位永远存在**（两种状态都渲染一个图标），
+/// 这样标题 / VIP / 收藏的相对位置不会因为下载状态变化而左右移动。
+pub(crate) fn download_slot(
+    track: &TrackItem,
+    is_downloaded: bool,
+    cx: &mut Context<Root>,
+) -> AnyElement {
+    if is_downloaded {
+        return div()
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .size(px(theme::size::CONTROL_SM))
+            .child(download_badge())
+            .into_any_element();
+    }
+    div()
+        .id("playback-download")
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .size(px(theme::size::CONTROL_SM))
+        .rounded(px(theme::radius::PILL))
+        .cursor_pointer()
+        .hover(|style| style.bg(theme::surface_hover()))
+        .on_click(cx.listener({
+            let track = track.clone();
+            move |root, _event: &ClickEvent, _window, cx| {
+                root.download_track(track.clone(), false, cx);
+            }
+        }))
+        .child(
+            svg()
+                .path(icons::path("download"))
+                .size(px(theme::ICON_SM))
+                .text_color(theme::text_muted()),
+        )
+        .into_any_element()
+}
+
 /// 表头：# / 歌曲 / 歌手 / 专辑 / 时长。
 /// 宽度不够时的折叠顺序（按用户要求）：先专辑 → 再时长 → 再歌手。
 /// 列间距与行内左右内边距（与下面的 flex 设置保持一致）。
 const COL_GAP: f32 = 12.0;
 const ROW_PAD: f32 = 12.0;
-/// 内联 VIP 徽章的宽度（含间距），标题文本需要先让出这一段。
-const VIP_WIDTH: f32 = 76.0;
+/// 「已下载」勾选槽位的宽度。
+///
+/// 槽位在行内**永远存在**（未下载时留空），因为 `cols.title` 是表头与所有行共用的
+/// 静态列宽，而 VIP 徽章就在槽位左边 —— 槽位若按行出现/消失，VIP 的 x 会跟着移动。
+const DOWNLOADED_SLOT_WIDTH: f32 = theme::ICON_SM;
 
 /// 当前可用宽度下各列是否显示 + **标题列的具体宽度**。
 ///
@@ -193,6 +258,7 @@ fn track_row(
     cols: Columns,
     tracks: std::sync::Arc<Vec<sodam_core::models::TrackItem>>,
     liked_ids: std::sync::Arc<std::collections::HashSet<String>>,
+    downloaded: crate::app::DownloadedIndex,
     covers: std::sync::Arc<std::collections::HashMap<String, std::path::PathBuf>>,
     cover_requests: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     current_track_id: Option<String>,
@@ -203,6 +269,7 @@ fn track_row(
     let menu_track = track.clone();
     let title_entity = entity.clone();
     let artist_entity = entity.clone();
+    let is_downloaded = downloaded.has(track);
     div()
         .id(("track", index))
         .group(TRACK_GROUP)
@@ -297,13 +364,12 @@ fn track_row(
             cover(cached, theme::size::ROW_ART, theme::radius::ART)
         })
         .child({
-            // 标题列宽度由 columns_for 显式算出（与表头同宽）；
-            // 有 VIP 徽章时先给徽章让出固定宽度，避免挤掉标题。
-            let text_width = if track.vip {
-                (cols.title - VIP_WIDTH).max(40.0)
-            } else {
-                cols.title
-            };
+            // 标题列宽度由 columns_for 显式算出（与表头同宽）。
+            //
+            // 徽章区靠右，且「已下载」槽位**永远占位**（不下载时是空 div）：
+            // VIP 徽章紧跟标题之后，如果按行决定要不要给勾让位，VIP 的 x 就会
+            // 因为「这一行是否已下载」而左右移动 —— 表现就是各行 VIP 对不齐。
+            // 交给 flex 分配（标题 flex_1）比手工从列宽里减更不容易错。
             div()
                 .w(px(cols.title))
                 .flex_none()
@@ -314,8 +380,7 @@ fn track_row(
                 .child(
                     div()
                         .id(("track-title-link", index))
-                        .w(px(text_width))
-                        .flex_none()
+                        .flex_1()
                         .min_w(px(0.0))
                         .truncate()
                         .cursor_pointer()
@@ -337,6 +402,17 @@ fn track_row(
                         .child(track.title.clone()),
                 )
                 .when(track.vip, |this| this.child(vip_badge()))
+                .child({
+                    // 「已下载」槽位：宽度固定、**永远渲染**（未下载时是空占位）。
+                    // 这是 VIP 能对齐的前提 —— 槽位一旦按行出现/消失，VIP 就会被推着走。
+                    div()
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .w(px(DOWNLOADED_SLOT_WIDTH))
+                        .when(is_downloaded, |this| this.child(download_badge()))
+                })
         })
         .when(cols.artist, |this| {
             this.child(
@@ -398,6 +474,7 @@ fn track_list(
     nav: Nav,
     scroll: Option<&gpui::UniformListScrollHandle>,
     liked_ids: std::sync::Arc<std::collections::HashSet<String>>,
+    downloaded: crate::app::DownloadedIndex,
     covers: std::sync::Arc<std::collections::HashMap<String, std::path::PathBuf>>,
     cover_requests: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     cx: &mut Context<Root>,
@@ -425,6 +502,7 @@ fn track_list(
                         cols,
                         tracks.clone(),
                         liked_ids.clone(),
+                        downloaded.clone(),
                         covers.clone(),
                         cover_requests.clone(),
                         current_track_id.clone(),
@@ -491,6 +569,18 @@ pub(crate) fn scrolling_detail_page(
     let cols = columns_for(root.list_width.lock().map(|width| *width).unwrap_or(1200.0));
     let width_slot = root.list_width.clone();
     let liked_ids = root.liked_ids.clone();
+    let downloaded = root.downloaded.clone();
+    // 「已下载 N 首」并进副标题。算在这里而不是各个调用方：这个入口被
+    // 我喜欢的音乐 / 歌单 / 艺人页 / 专辑页共用，改一处全部生效。
+    let downloaded_count = tracks.iter().filter(|track| downloaded.has(track)).count();
+    let subtitle = if downloaded_count > 0 {
+        format!(
+            "{subtitle} · {}",
+            root.localized("已下载 {} 首", &[downloaded_count.to_string()])
+        )
+    } else {
+        subtitle
+    };
     let covers = root.covers.clone();
     let cover_requests = root.cover_requests.clone();
     let albums = albums.clone();
@@ -660,6 +750,7 @@ pub(crate) fn scrolling_detail_page(
                 cols,
                 row_tracks.clone(),
                 liked_ids.clone(),
+                downloaded.clone(),
                 covers.clone(),
                 cover_requests.clone(),
                 current_track_id.clone(),
@@ -855,6 +946,21 @@ fn subtitle_for(root: &Root) -> String {
         Nav::Scenes => root.tr("按场景选歌").to_string(),
         Nav::Artist => root.tr("音乐人详情").to_string(),
         Nav::Album => root.tr("专辑详情").to_string(),
+        Nav::Local => {
+            if root.library.is_empty() && root.library_missing.is_empty() {
+                root.tr("还没有下载到本地的歌曲").to_string()
+            } else if root.library_missing.is_empty() {
+                root.localized("{} 首", &[root.library.len().to_string()])
+            } else {
+                root.localized(
+                    "{} 首 · {} 首待重下",
+                    &[
+                        root.library.len().to_string(),
+                        root.library_missing.len().to_string(),
+                    ],
+                )
+            }
+        }
     }
 }
 
@@ -977,6 +1083,8 @@ pub fn track_menu(root: &Root, cx: &mut Context<Root>) -> AnyElement {
     };
     let menu_track = menu.track.clone();
     let download_track = menu.track.clone();
+    // 已下载时把「下载」改成「重新下载」——保持可点，不做成灰掉的死项。
+    let is_downloaded = root.downloaded.has(&menu.track);
 
     gpui::deferred(
         gpui::anchored()
@@ -1056,7 +1164,11 @@ pub fn track_menu(root: &Root, cx: &mut Context<Root>) -> AnyElement {
                                     .size(px(theme::ICON_SM))
                                     .text_color(theme::text_muted()),
                             )
-                            .child(root.tr("下载")),
+                            .child(root.tr(if is_downloaded {
+                                "重新下载"
+                            } else {
+                                "下载"
+                            })),
                     ),
             ),
     )
@@ -1207,6 +1319,7 @@ pub fn render(root: &Root, window: &Window, cx: &mut Context<Root>) -> impl Into
         Nav::Album => search::album_page(root, cx),
         Nav::Settings => settings::settings_view(root, cx),
         Nav::Lyrics => lyrics::lyrics_view(root, window, cx),
+        Nav::Local => local_music::local_music_page(root, cx),
     };
 
     div()

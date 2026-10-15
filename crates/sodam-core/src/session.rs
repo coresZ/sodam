@@ -42,6 +42,16 @@ fn hash_url(url: &str) -> u64 {
     hash
 }
 
+/// `file://<路径>` → 本地路径；不是本地伪 URL 则 `None`。
+///
+/// 本地音乐页的旁路封面走这个约定：既复用了 `Root.covers`（URL → 本地路径）
+/// 这套现成的管道，又不必给封面池加一条全新的分支。
+fn local_file_url_path(url: &str) -> Option<std::path::PathBuf> {
+    url.strip_prefix("file://")
+        .filter(|rest| !rest.is_empty())
+        .map(std::path::PathBuf::from)
+}
+
 /// 账号信息（登录后展示用）。
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct AccountInfo {
@@ -433,7 +443,9 @@ impl Session {
     /// 封面走 CDN，和音频一样只依赖 URL；缓存目录见 [`crate::paths::cache_dir`]，
     /// 文件名用 URL 的哈希，避免奇怪字符和重复下载。
     /// 原始封面缓存：歌词页使用原图，列表仍使用缩略图。
-    pub fn original_cover_path(&self, url: &str) -> Option<std::path::PathBuf> {
+    ///
+    /// 网络封面专用；`file://` 伪 URL 的入口是 [`Self::original_cover_path`]。
+    fn remote_original_cover_path(&self, url: &str) -> Option<std::path::PathBuf> {
         let url = url.trim();
         if url.is_empty() {
             return None;
@@ -485,6 +497,10 @@ impl Session {
         if url.is_empty() {
             return None;
         }
+        // 本地文件（下载目录的旁路封面）没有 URL 可下：直接读盘 + 缩放缓存。
+        if let Some(local) = local_file_url_path(url) {
+            return self.cover_path_from_local(&local);
+        }
         let dir = crate::audio::cover_cache_dir();
         std::fs::create_dir_all(&dir).ok()?;
         // 文件名带目标边长：换尺寸/旧的全尺寸缓存不会混用
@@ -524,6 +540,53 @@ impl Session {
             }
         }
         Some(path)
+    }
+
+    /// 本地图片（`file://` 伪 URL）→ 缩略图缓存路径。
+    ///
+    /// 与网络封面共用同一套缓存（`covers/<hash>-160.img`），所以
+    /// **列表与播放页的渲染路径完全不用改** —— 它们只认 `Root.covers` 里的路径。
+    /// 缓存键是伪 URL 本身，因此同一个旁路文件只会缩放一次。
+    fn cover_path_from_local(&self, source: &std::path::Path) -> Option<std::path::PathBuf> {
+        let url = format!("file://{}", source.display());
+        let dir = crate::audio::cover_cache_dir();
+        std::fs::create_dir_all(&dir).ok()?;
+        let path = dir.join(format!("{:016x}-{COVER_MAX_EDGE}.img", hash_url(&url)));
+        if std::fs::metadata(&path)
+            .map(|meta| meta.len() > 0)
+            .unwrap_or(false)
+        {
+            return Some(path);
+        }
+        let bytes = std::fs::read(source).ok()?;
+        if bytes.is_empty() {
+            return None;
+        }
+        let shrunk = image::load_from_memory(&bytes)
+            .ok()
+            .map(|image| image.thumbnail(COVER_MAX_EDGE, COVER_MAX_EDGE));
+        match shrunk {
+            Some(image) => {
+                let mut encoded = std::io::Cursor::new(Vec::new());
+                image.write_to(&mut encoded, image::ImageFormat::Png).ok()?;
+                std::fs::write(&path, encoded.into_inner()).ok()?;
+            }
+            None => {
+                std::fs::write(&path, &bytes).ok()?;
+            }
+        }
+        Some(path)
+    }
+
+    /// 本地图片（`file://` 伪 URL）→ 原图路径（播放页大图用）。
+    ///
+    /// 旁路图本身通常就是 960px 级别，直接返回原文件即可，不再复制一份。
+    pub fn original_cover_path(&self, url: &str) -> Option<std::path::PathBuf> {
+        let url = url.trim();
+        if let Some(local) = local_file_url_path(url) {
+            return local.is_file().then_some(local);
+        }
+        self.remote_original_cover_path(url)
     }
 }
 

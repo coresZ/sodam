@@ -289,7 +289,11 @@ pub fn render(root: &Root, cx: &mut Context<Root>) -> impl IntoElement {
     let liked = track
         .as_ref()
         .is_some_and(|track| root.liked_ids.contains(&track.id));
-    let cover_path = track.as_ref().and_then(|track| root.cover_of(&track.cover));
+    // 封面来源必须与播放页 / 准备逻辑一致：本地曲目走旁路 `file://` 伪 URL，
+    // 直接用 `track.cover` 对本地文件是空的，底部播放条会一直是占位块。
+    let cover_path = track
+        .as_ref()
+        .and_then(|track| root.cover_of(&root.playback_cover_source(track)));
 
     div()
         .flex()
@@ -707,18 +711,28 @@ fn queue_section_row(title: &str) -> gpui::AnyElement {
         .into_any_element()
 }
 
-/// 主界面的右侧队列抽屉。
-pub fn queue_drawer(root: &Root, cx: &mut Context<Root>) -> impl IntoElement {
-    queue_drawer_inner(root, cx, false)
+/// 队列抽屉的设计宽度（下限）。叠加时实际宽度由调用方按视口算好传入
+/// （`app.rs::overlay_panel_width`）—— 叠加层不能用样式百分比：绝对定位层
+/// 宽度是 auto，`relative(..)` 会按元素自身宽度解析（320px × 0.4 = 128px）。
+pub(crate) const DRAWER_W: f32 = 320.0;
+
+/// 主界面的右侧队列抽屉。`width` 由调用方按视口算成确定像素。
+pub fn queue_drawer(root: &Root, width: f32, cx: &mut Context<Root>) -> impl IntoElement {
+    queue_drawer_inner(root, cx, Some(width))
 }
 
-/// 歌词页内嵌队列：无侧边分割线，背景融入歌词页。
+/// 歌词页内嵌队列：无侧边分割线，背景融入歌词页；宽度由父容器决定。
 pub fn queue_panel(root: &Root, cx: &mut Context<Root>) -> impl IntoElement {
-    queue_drawer_inner(root, cx, true)
+    queue_drawer_inner(root, cx, None)
 }
 
-/// 队列内容：主界面为 320px 抽屉；歌词页为无边界内嵌面板。
-fn queue_drawer_inner(root: &Root, cx: &mut Context<Root>, embedded: bool) -> impl IntoElement {
+/// 队列内容：主界面为右侧抽屉（`overlay_width` 有值）；歌词页为无边界内嵌面板。
+fn queue_drawer_inner(
+    root: &Root,
+    cx: &mut Context<Root>,
+    overlay_width: Option<f32>,
+) -> impl IntoElement {
+    let embedded = overlay_width.is_none();
     use std::sync::Arc;
 
     let language = root.language;
@@ -728,6 +742,13 @@ fn queue_drawer_inner(root: &Root, cx: &mut Context<Root>, embedded: bool) -> im
     let covers = root.covers.clone();
     let cover_requests = root.cover_requests.clone();
     let liked_ids = root.liked_ids.clone();
+    let downloaded = root.downloaded.clone();
+    // 本地曲目的封面来源（`file://` 伪 URL）预先算好：渲染闭包拿不到 `&Root`。
+    let local_covers: std::collections::HashMap<String, String> = tracks
+        .iter()
+        .map(|track| (track.id.clone(), root.playback_cover_source(track)))
+        .collect();
+    let local_covers = Arc::new(local_covers);
     let entity = cx.entity();
     let count = slots.len();
     let total = root.queue.len();
@@ -748,7 +769,10 @@ fn queue_drawer_inner(root: &Root, cx: &mut Context<Root>, embedded: bool) -> im
                         let Some(track) = tracks.get(index) else {
                             return div().h(px(QUEUE_ROW_H)).into_any_element();
                         };
-                        let url = track.cover.clone();
+                        let url = local_covers
+                            .get(&track.id)
+                            .cloned()
+                            .unwrap_or_else(|| track.cover.clone());
                         let cached = covers.get(&url).cloned();
                         // 只有渲染出来的行才排队取封面（虚拟列表只渲染可见行）
                         if cached.is_none() && !url.is_empty() {
@@ -761,6 +785,7 @@ fn queue_drawer_inner(root: &Root, cx: &mut Context<Root>, embedded: bool) -> im
                         let title = track.title.clone();
                         let artist = track.artist.clone();
                         let duration = track.duration_label();
+                        let downloaded_here = downloaded.has(track);
                         let entity = entity.clone();
                         div()
                             .id(("queue-slot", slot_index))
@@ -812,15 +837,34 @@ fn queue_drawer_inner(root: &Root, cx: &mut Context<Root>, embedded: bool) -> im
                                     .flex_1()
                                     .min_w(px(0.0))
                                     .child(
+                                        // 标题 + 「已下载」图标：标题可截断，图标不参与压缩
                                         div()
-                                            .truncate()
-                                            .text_size(theme::Text::Body.size())
-                                            .text_color(if playing {
-                                                theme::accent()
-                                            } else {
-                                                theme::text()
-                                            })
-                                            .child(title),
+                                            .flex()
+                                            .flex_row()
+                                            .items_center()
+                                            .gap(px(theme::space::XS))
+                                            .child(
+                                                div()
+                                                    .flex_1()
+                                                    .min_w(px(0.0))
+                                                    .truncate()
+                                                    .text_size(theme::Text::Body.size())
+                                                    .text_color(if playing {
+                                                        theme::accent()
+                                                    } else {
+                                                        theme::text()
+                                                    })
+                                                    .child(title),
+                                            )
+                                            .when(downloaded_here, |this| {
+                                                this.child(
+                                                    svg()
+                                                        .path(icons::path("check"))
+                                                        .size(px(theme::ICON_SM))
+                                                        .flex_none()
+                                                        .text_color(theme::text_muted()),
+                                                )
+                                            }),
                                     )
                                     .child(
                                         div()
@@ -904,12 +948,15 @@ fn queue_drawer_inner(root: &Root, cx: &mut Context<Root>, embedded: bool) -> im
                 .min_w(px(0.0))
                 .bg(gpui::transparent_black())
         })
-        .when(!embedded, |this| {
-            this.w(px(320.0))
+        .when_some(overlay_width, |this, width| {
+            // 叠加在内容之上：宽度由调用方按视口算成确定像素（见 `app.rs`），
+            // 并加左侧阴影与边框把它和下面的内容分开（不然会糊在一起）。
+            this.w(px(width))
                 .flex_none()
                 .bg(theme::bg())
                 .border_l_1()
                 .border_color(theme::border())
+                .shadow_lg()
         })
         .child(
             div()

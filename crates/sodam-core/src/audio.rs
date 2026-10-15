@@ -9,6 +9,8 @@ use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
+use rodio::Source;
+
 use crate::models::TrackItem;
 
 /// 播放器状态快照（UI 每帧读这个，加锁时间极短）。
@@ -231,6 +233,16 @@ fn audio_thread(rx: Receiver<Command>, state: Arc<Mutex<PlaybackSnapshot>>) {
                         continue;
                     }
                 };
+                // 时长：优先用**容器头探测**的真实值。
+                //
+                // 下载目录里的文件（尤其用户手动放进去的）`track.duration_seconds`
+                // 往往是 0，之前直接把它写进快照 → 播放页显示 `--:--`、进度条分母是 0。
+                // `Decoder` 的 `total_duration()` 只读容器头（MP4 的 mvhd / FLAC 的
+                // STREAMINFO / MP3 的 Xing 等），不解码音频，开销可忽略。
+                let probed_duration = decoder
+                    .total_duration()
+                    .map(|duration| duration.as_secs_f64())
+                    .filter(|seconds| *seconds > 0.0);
                 let new_player = rodio::Player::connect_new(device.mixer());
                 let volume = state.lock().map(|snap| snap.volume).unwrap_or(1.0);
                 new_player.set_volume(volume);
@@ -241,7 +253,9 @@ fn audio_thread(rx: Receiver<Command>, state: Arc<Mutex<PlaybackSnapshot>>) {
                     snap.title = track.title.clone();
                     snap.playing = true;
                     snap.position_seconds = 0.0;
-                    snap.duration_seconds = track.duration_seconds.max(0) as f64;
+                    // 探测值优先；取不到（个别流没有时长头）才回退到元数据里的值。
+                    snap.duration_seconds =
+                        probed_duration.unwrap_or_else(|| track.duration_seconds.max(0) as f64);
                     snap.quality = quality.clone();
                     snap.error.clear();
                     snap.finished = false;
@@ -319,6 +333,68 @@ fn format_seconds(seconds: f64) -> String {
 /// 音频缓存目录。
 pub fn cache_dir() -> std::path::PathBuf {
     crate::paths::cache_dir().join("audio")
+}
+
+/// 探测音频文件的时长（秒）。取不到返回 `None`。
+///
+/// 两条路径，按开销从低到高：
+///
+/// 1. **MP4 系（m4a / mp4）手写 mvhd 解析**：只读文件头部若干 KB，微秒级。
+///    下载目录里绝大多数是这个容器（服务端无损就是 FLAC-in-MP4）。
+/// 2. **其它容器交给 rodio**：`Decoder::total_duration()` 通常也只读头部，
+///    但 MP3 没有 Xing 头时会退化成全文件扫描 —— 所以调用方要按需使用，
+///    不要在扫描热路径上对未知格式无脑调用。
+///
+/// 纯文件 I/O，**必须在后台线程调用**（见 `AGENTS.md` 第 2 条）。
+pub fn probe_duration(path: &std::path::Path) -> Option<f64> {
+    if let Some(seconds) = probe_mp4_duration(path) {
+        return Some(seconds);
+    }
+    let file = std::fs::File::open(path).ok()?;
+    let decoder = rodio::Decoder::new(std::io::BufReader::new(file)).ok()?;
+    let duration = decoder.total_duration()?.as_secs_f64();
+    (duration > 0.0).then_some(duration)
+}
+
+/// MP4 系容器的时长：定位 `moov/mvhd`，按 `duration / timescale` 算。
+///
+/// 手写而不是走 rodio，是因为下载目录里这是**绝大多数**文件的格式，
+/// 而扫描要对每个文件都探测一次 —— 省掉一次解码器构造有意义。
+///
+/// 只读文件头部（`moov` 在流式 MP4 里通常前置）；找不到就返回 `None`
+/// 让上层回退到 rodio。
+fn probe_mp4_duration(path: &std::path::Path) -> Option<f64> {
+    use std::io::Read;
+
+    const SCAN_LIMIT: usize = 2 * 1024 * 1024;
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut buffer = vec![0u8; SCAN_LIMIT];
+    let read = file.read(&mut buffer).ok()?;
+    buffer.truncate(read);
+    if buffer.len() < 32 || &buffer[4..8] != b"ftyp" {
+        return None;
+    }
+    // 在头部窗口里找 `mvhd`（box 嵌套，直接扫签名比走 box 树简单且够用）。
+    let signature = b"mvhd";
+    let position = buffer.windows(4).position(|window| window == signature)?;
+    let body = buffer.get(position + 4..)?;
+    let version = *body.first()?;
+    // `body` 从 `mvhd` 四字节类型之后开始，即 body[0] = version。
+    // v0: version(1) flags(3) creation(4) modification(4) timescale(4) duration(4)
+    // v1: version(1) flags(3) creation(8) modification(8) timescale(4) duration(8)
+    let (timescale, duration) = if version == 1 {
+        let timescale = u32::from_be_bytes(body.get(20..24)?.try_into().ok()?);
+        let duration = u64::from_be_bytes(body.get(24..32)?.try_into().ok()?);
+        (timescale, duration)
+    } else {
+        let timescale = u32::from_be_bytes(body.get(12..16)?.try_into().ok()?);
+        let duration = u32::from_be_bytes(body.get(16..20)?.try_into().ok()?) as u64;
+        (timescale, duration)
+    };
+    if timescale == 0 || duration == 0 {
+        return None;
+    }
+    Some(duration as f64 / timescale as f64)
 }
 
 /// 封面缓存目录。
@@ -435,6 +511,69 @@ mod tests {
         // 歌曲数：只数 .m4a（边车/part 不算歌）
         assert_eq!(count_extension(&dir, "m4a"), 1);
         assert_eq!(count_extension(&dir, "img"), 0, "只看顶层");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 构造一个最小 MP4 头：`ftyp` + `moov` 里一个 `mvhd`。
+    ///
+    /// 字节布局对齐真实下载文件（实测 `Yang.m4a` 的头部）：
+    /// `mvhd` 之后依次是 version(1) flags(3) creation(4) modification(4)
+    /// timescale(4) duration(4)。
+    fn fake_mp4(timescale: u32, duration: u32, version: u8) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&[0, 0, 0, 0x1c]); // ftyp box size
+        bytes.extend_from_slice(b"ftypisom");
+        bytes.extend_from_slice(&[0, 0, 0, 0]); // 补足 ftyp（真实文件更长，够用即可）
+        bytes.extend_from_slice(&[0, 0, 0, 0x6c]); // moov box size
+        bytes.extend_from_slice(b"moov");
+        bytes.extend_from_slice(&[0, 0, 0, 0x6c]); // mvhd box size
+        bytes.extend_from_slice(b"mvhd");
+        bytes.push(version);
+        bytes.extend_from_slice(&[0, 0, 0]); // flags
+        if version == 1 {
+            bytes.extend_from_slice(&[0u8; 8]); // creation_time
+            bytes.extend_from_slice(&[0u8; 8]); // modification_time
+            bytes.extend_from_slice(&timescale.to_be_bytes());
+            bytes.extend_from_slice(&(duration as u64).to_be_bytes());
+        } else {
+            bytes.extend_from_slice(&[0u8; 4]); // creation_time
+            bytes.extend_from_slice(&[0u8; 4]); // modification_time
+            bytes.extend_from_slice(&timescale.to_be_bytes());
+            bytes.extend_from_slice(&duration.to_be_bytes());
+        }
+        bytes
+    }
+
+    #[test]
+    fn probe_mp4_duration_reads_the_mvhd() {
+        let dir = std::env::temp_dir().join(format!("sodam-probe-mp4-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("sample.m4a");
+        // 与实测文件同构：timescale=1000、duration=193493 → 193.493 秒。
+        std::fs::write(&path, fake_mp4(1000, 193493, 0)).expect("write");
+
+        let seconds = probe_mp4_duration(&path).expect("应解析出时长");
+        assert!(
+            (seconds - 193.493).abs() < 0.01,
+            "期望 193.493 秒，实际 {seconds}"
+        );
+
+        // v1 头（64 位时长）也要认。
+        let path_v1 = dir.join("sample-v1.m4a");
+        std::fs::write(&path_v1, fake_mp4(1000, 193493, 1)).expect("write");
+        let seconds_v1 = probe_mp4_duration(&path_v1).expect("v1 应解析出时长");
+        assert!((seconds_v1 - 193.493).abs() < 0.01, "实际 {seconds_v1}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn probe_mp4_duration_rejects_non_mp4() {
+        let dir = std::env::temp_dir().join(format!("sodam-probe-bad-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("not-mp4.bin");
+        std::fs::write(&path, b"RIFF____WAVEfmt ").expect("write");
+        assert!(probe_mp4_duration(&path).is_none(), "非 MP4 不该给结果");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

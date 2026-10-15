@@ -45,6 +45,8 @@ impl Root {
                     open_when_done,
                 } => {
                     self.set_status("「{}」下载完成", std::slice::from_ref(&title));
+                    // 刚落盘的文件要进「已下载」标记，重扫一次下载目录。
+                    self.refresh_local(cx);
                     if open_when_done {
                         if let Some(dir) = path.parent() {
                             self.open_folder(dir, cx);
@@ -229,6 +231,45 @@ impl Root {
                 self.status = self.localized("保存失败：{err}", &[err.to_string()]);
             }
         }
+        // 目录或命名模板可能变了：本地音乐列表与「已下载」快照都要跟着重算。
+        self.refresh_local(cx);
+        cx.notify();
+    }
+
+    /// 下载管理里的「清理记录」：清掉失败 / 已取消的任务，以及清单里已失效的条目。
+    ///
+    /// **一律不碰磁盘文件** —— 删文件是另一件事（本地音乐页的「删除本地文件」）。
+    /// 所以清理之后，「本地音乐」里那些文件仍然在（只是退回成没有元数据的裸文件）。
+    pub fn clear_download_records(&mut self, cx: &mut Context<Self>) {
+        let mut cleared = 0usize;
+
+        // 失败 / 已取消的任务：逐条从管理器移除（用现成的 remove，不新增核心 API）。
+        // 迭代的是快照，所以边遍历边移除是安全的。
+        for task in self
+            .downloads
+            .tasks()
+            .iter()
+            .filter(|task| task.state.is_failed())
+        {
+            self.downloads.remove(task.id);
+            cleared += 1;
+        }
+
+        // 清单里有、磁盘上已经没了的条目：记录也一并清掉（文件本来就不在了）。
+        for entry in self.library_missing.as_ref() {
+            if let Err(err) =
+                sodam_core::download_library::remove(&self.settings.download, &entry.relative)
+            {
+                if std::env::var("SODAM_DOWNLOAD_LOG").is_ok() {
+                    eprintln!("[download] 清理下载记录失败：{err}");
+                }
+            } else {
+                cleared += 1;
+            }
+        }
+
+        self.status = self.localized("已清理 {} 条记录", &[cleared.to_string()]);
+        self.refresh_local(cx);
         cx.notify();
     }
 }

@@ -156,14 +156,25 @@ fn main() {
                     .map(|path| path.display().to_string())
                     .unwrap_or_else(|| "(无)".to_string())
             );
-            // 目录内容清单（确认临时文件没有残留）
-            if let Ok(entries) = std::fs::read_dir(download.resolve_dir()) {
+            // 目录清单：根（音频）+ image/ + lrc/ 三个位置，一并确认没有 .part 残留
+            let root = download.resolve_dir();
+            for sub in ["", "image", "lrc"] {
+                let label = if sub.is_empty() { "根" } else { sub };
+                let dir = if sub.is_empty() {
+                    root.clone()
+                } else {
+                    root.join(sub)
+                };
+                let Ok(entries) = std::fs::read_dir(&dir) else {
+                    println!("   {label}/：不存在");
+                    continue;
+                };
                 let mut names: Vec<String> = entries
                     .filter_map(|entry| entry.ok())
                     .map(|entry| entry.file_name().to_string_lossy().to_string())
                     .collect();
                 names.sort();
-                println!("   目录内容：{names:?}");
+                println!("   {label}/：{names:?}");
                 assert!(
                     !names.iter().any(|name| name.ends_with(".part")),
                     "下载完成后不应残留 .part 临时文件"
