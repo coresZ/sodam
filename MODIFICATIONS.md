@@ -834,3 +834,96 @@ GPUI 的 deferred 按**优先级升序** prepaint / paint，鼠标冒泡按**注
   全 crate 无渲染点（已核实），全局提示目前没有出口。
 - 纯文档 / 注释改动，无行为变化；`fmt --all -- --check` 通过（其余编译门未跑）。
 
+## 2026-10-15 — 存量下载目录旁路迁移脚本（旧扁平布局 → image/ + lrc/）
+
+用户实际部署目录 `D:\soft\app\SodaM\down` 是 0.3.x 之前的**扁平布局**（封面 / 歌词
+与音频平铺），而当前代码与产品语义已改为 `<下载根>/image/` 与 `<下载根>/lrc/`
+（`scan_sidecars` 只读这两个子目录）。补一个一次性维护脚本把存量文件收进新布局。
+
+### 脚本
+
+- **`scripts/migrate-sidecars.py`（新增）**：
+  - 判定与 `sodam-core` 的 `scan_sidecars` 对齐：`png/jpg/jpeg/webp → image/`、
+    `lrc → lrc/`；按**文件名 stem** 配对（与产品同源，不按清单）。
+  - 默认**演练**（不动文件），`--apply` 才执行；`--include-unpaired` 可连无配对音频的
+    图片 / 歌词一并迁入（默认留在原地）。
+  - 递归子目录；根下的 `image/`、`lrc/` 跳过 —— **幂等**，可重复运行。
+  - 冲突：目标已有**内容相同**文件 → 删来源副本（`dedupe`）；**内容不同** →
+    来源改名 `"<stem> (2).<ext>"` 移入（`rename`）。用 SHA-256 比对，不做覆盖。
+  - 日志（默认 `<root>/migrate-sidecars.log`，UTF-8）逐条记录 move / rename / dedupe
+    / 跳过原因，可据此人工回滚；**追加写**，保留历次运行记录。
+  - 结尾打印汇总，包括「迁移后仍无封面的音频数 / 无歌词的音频数」，便于对账。
+  - 用 `os.walk` + `shutil` 同级的 `os.rename`；不引入第三方依赖。
+
+### 实测（Windows x64，真实部署目录）
+
+- 源目录 `D:\soft\app\SodaM\down`：425 个文件**全部平铺在根** ——
+  144 音频（118 mp4 + 26 m4a）、144 图片（143 png + 1 jpg）、137 lrc。
+- 演练：281 个旁路文件（144 图 + 137 词）**全部能配对**，根下无孤儿、0 冲突。
+- `--apply` 执行：`move 281`、`rename 0`、`dedupe 0`、`failures 0`。
+- 执行后状态：根下 145 个文件（144 音频 + 日志）；`image/` = 143 png + 1 jpg（144）；
+  `lrc/` = 137 lrc。抽取 `Olly Murs - That Girl`、`Snowhite - Mirror Solitude` 两组
+  核对音频 / 图 / 词落位正确。
+- 复跑演练：`sidecars 0`、全 `placed` —— 幂等性成立。
+- 合成场景测试（临时目录）覆盖真实数据没触发的分支：`dedupe`（同内容删除来源）、
+  `rename`（不同内容加序号）、`unpaired`（跳过）、`nested`（递归子目录）——
+  8 项断言全过。
+
+### 需要人工注意
+
+- **部署中的 exe 是 10/14 10:43 的旧构建**（早于旁路改子目录的 `2b8e649`，10/15 14:17）。
+  旧构建写的是扁平旁路、也读不到新布局 —— 迁移后要让部署目录指向新布局生效，
+  需要**重新构建并替换 `D:\soft\app\SodaM\sodam.exe`**（本次未做，工作区未动代码）。
+- 迁移**不动音频**；清单 `.sodam-downloads.json` 不在该目录（便携版清单本就不存在，
+  该目录是纯落盘目录），未涉及。
+- 日志覆盖事故：首次 `--apply` 的逐条日志被随后的验证演练覆盖（脚本原为覆盖写），
+  已在日志中补记实际执行结果（281 条、0 失败），脚本已改为**追加写**。
+
+## 2026-10-15 — 合并上游 main 到 feat/0.3.0（v0.2.5–0.2.7 → 0.3.0 线）
+
+用户要求「拉取上游代码的同时保留新功能」。本地 `main` 原停在 `1d812fb`（落后
+`origin/main` 9 个提交），已快进到 `f3138d4`（v0.2.7），再整体并入 `feat/0.3.0`。
+合并提交 `f015ae3`（本地，未推送）。
+
+### 上游带入的内容（0.2.5 – 0.2.7）
+
+- `perf(cover)`：照 sonora 重做封面缓存 —— 按显示尺寸解码 + 16MB 预算
+  （`ui/cover_cache.rs` 大改、`ui/artwork.rs` 重写、`image` crate 打开
+  jpeg/webp/gif 特性）。
+- `perf(mem)`：整曲解密后 `mem::release_malloc_pressure()` 归还 malloc 空闲页
+  （新文件 `sodam-core/src/mem.rs`；`session.rs` 落盘点调用）。
+- `fix(ui)`：Windows / macOS 标题栏与面板背景色差（`ui/titlebar.rs`、
+  `sidebar` / 内容区下移、根元素统一画渐变、队列面板让开窗口按钮）。
+- `feat(playback)`：推荐流 / 电台回传 `played_media`（`play_report.rs`、
+  `library.rs`）。
+- 依赖升级：`gpui` `68d1d0b → 5ff26c7`、`libresoda` `c0b911b → 928797d`。
+
+### 冲突解决（7 个文件，与只读预演完全一致）
+
+- **版本号族**：`Cargo.toml` / `Cargo.lock`（sodam、sodam-core 两处）/
+  `packaging/arch/PKGBUILD` / `README.md`（8 处）—— 保留 **0.3.0** 线。
+  依赖段（gpui / libresoda rev）取上游新值。
+- **`crates/sodam-core/src/lib.rs`**：`match_metadata`（本线）与 `mem`（上游）并存。
+- **`crates/sodam/src/views/lyrics.rs`**：保留本线
+  `playback_cover_source` / `download_slot` / `is_downloaded`，吸收上游
+  `cover_loading_gate`（切曲 200ms 加载态）与「重试按钮内嵌封面」布局。
+- **`crates/sodam/src/ui/player_bar.rs`**：保留本线叠加抽屉（`DRAWER_W`、
+  `overlay_panel_width`）、本地曲目封面来源、下载入口；吸收上游
+  Windows 标题栏避让（`.pt(STRIP_HEIGHT)`）。
+
+### 验证
+
+- `cargo check --offline --workspace` / `fmt --all -- --check` /
+  `clippy --offline --workspace --all-targets -- -D warnings` /
+  `test --offline --workspace`（**103** 个）/ `build --offline -p sodam`：全绿。
+- i18n：调用 key 293、词典 411、**0 遗漏**。
+- 两侧功能抽查：本线（sidebar 本地音乐 / app_download / local_music /
+  match_metadata / paths / 叠加抽屉）与上游（mem / cover_cache / titlebar /
+  lyrics_cover_gate / played_media）均在。
+- **真机冒烟（Windows x64，合并后新构建）**：启动无 panic、stderr 干净；
+  截图确认侧边栏含「本地音乐」、播放栏含下载入口、播放页封面与歌词正常
+  （上游新封面链路生效）、设置页含下载设置区块。
+- 排查记录：`SODAM_NAV=local` 启动时会被启动期异步推荐加载的
+  `open_lyrics()` 覆盖（既有 dev 工具竞态，与本次合并无关），截图核对以
+  手动点击侧边栏为准。
+
