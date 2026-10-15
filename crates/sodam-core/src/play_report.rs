@@ -9,7 +9,7 @@
 use std::time::Instant;
 
 use libresoda::soda::media_ref::MediaRef;
-use libresoda::{ApplogIdentity, PlayAction, PlayEndReason, Soda};
+use libresoda::{ApplogIdentity, MediaPlayed, PlayAction, PlayEndReason, Soda};
 
 use crate::audio::PlaybackSnapshot;
 use crate::config::Settings;
@@ -26,6 +26,7 @@ const PROGRESS_THRESHOLD_SECONDS: f64 = 0.5;
 #[derive(Debug, Clone)]
 struct CurrentPlay {
     track_id: String,
+    media_type: String,
     duration_seconds: f64,
     /// 实际播放毫秒（暂停不计）。
     played_ms: i64,
@@ -35,11 +36,27 @@ struct CurrentPlay {
     finished: bool,
 }
 
+/// 一条已结束的播放记录（官方 `PlayRecord`），用于拼 `played_media`。
+#[derive(Debug, Clone)]
+struct PlayedRecord {
+    media_id: String,
+    media_type: String,
+    duration_seconds: i64,
+    played_ms: i64,
+}
+
+/// 保留的播放记录条数（官方 `finishPlayRecord` 也是 100）。
+const MAX_RECORDS: usize = 100;
+/// `played_media` 一次最多回传的条数（官方 `getMediaPlayed` 的 `MAX_COUNT`）。
+const MAX_PLAYED_MEDIA: usize = 30;
+
 /// 播放上报器：由 UI 心跳周期性喂 [`PlaybackSnapshot`]。
 pub struct PlayReporter {
     settings: Settings,
     identity: ApplogIdentity,
     current: Option<CurrentPlay>,
+    /// 已结束的播放记录（最近在后），用于 `played_media`。
+    records: Vec<PlayedRecord>,
     last_observe: Instant,
     /// 上一拍是否在播（识别「播放 → 暂停」）。
     was_playing: bool,
@@ -58,6 +75,7 @@ impl PlayReporter {
             settings,
             identity,
             current: None,
+            records: Vec::new(),
             last_observe: Instant::now(),
             was_playing: false,
             emit: true,
@@ -99,13 +117,19 @@ impl PlayReporter {
         // 1) 曲目变化：结束上一首，开始新的一首。
         let snapshot_id = snapshot.track_id.trim();
         let current_id = self.current.as_ref().map(|c| c.track_id.as_str());
-        if current_id != Some(snapshot_id) {
-            if let Some(previous) = self.current.take() {
+        let track_changed = current_id != Some(snapshot_id);
+        if track_changed {
+            if let Some(mut previous) = self.current.take() {
+                // 本拍的时长属于上一首（它一直在播），不能算到新曲目头上。
+                if self.was_playing {
+                    previous.played_ms = previous.played_ms.saturating_add(delta_ms);
+                }
                 let reason = if previous.finished {
                     PlayEndReason::Finished
                 } else {
                     PlayEndReason::Next
                 };
+                self.remember(previous.clone());
                 self.report_end(previous, reason);
             }
             if !snapshot_id.is_empty() {
@@ -118,6 +142,7 @@ impl PlayReporter {
                 self.spawn_start(media);
                 self.current = Some(CurrentPlay {
                     track_id: snapshot_id.to_string(),
+                    media_type: "track".to_string(),
                     duration_seconds: duration,
                     played_ms: 0,
                     progress_reported: false,
@@ -132,18 +157,20 @@ impl PlayReporter {
             if snapshot.duration_seconds > 0.0 {
                 current.duration_seconds = snapshot.duration_seconds;
             }
-            if snapshot.playing {
+            // 切曲那一拍上面已经把时长记给上一首了，这里不再重复计。
+            if snapshot.playing && !track_changed {
                 current.played_ms = current.played_ms.saturating_add(delta_ms);
-                if !current.progress_reported
-                    && snapshot.position_seconds > PROGRESS_THRESHOLD_SECONDS
-                {
-                    current.progress_reported = true;
-                    progress_to_report = Some((
-                        current.track_id.clone(),
-                        snapshot.position_seconds,
-                        current.duration_seconds,
-                    ));
-                }
+            }
+            if snapshot.playing
+                && !current.progress_reported
+                && snapshot.position_seconds > PROGRESS_THRESHOLD_SECONDS
+            {
+                current.progress_reported = true;
+                progress_to_report = Some((
+                    current.track_id.clone(),
+                    snapshot.position_seconds,
+                    current.duration_seconds,
+                ));
             }
             if snapshot.finished {
                 current.finished = true;
@@ -175,6 +202,50 @@ impl PlayReporter {
             .as_ref()
             .map(|c| c.progress_reported)
             .unwrap_or(false)
+    }
+
+    /// 拼推荐流 / 电台请求里的 `played_media`：当前曲目实时毫秒 + 历史记录（最近在前）。
+    ///
+    /// 这是官方上报听歌时长的真正通道（`getMediaPlayed`）。
+    pub fn played_media(&self) -> Vec<MediaPlayed> {
+        let mut out: Vec<MediaPlayed> = Vec::new();
+        if let Some(current) = &self.current {
+            if current.played_ms > 0 {
+                out.push(MediaPlayed::played(
+                    current.track_id.clone(),
+                    current.media_type.clone(),
+                    current.duration_seconds.round() as i64,
+                    current.played_ms,
+                ));
+            }
+        }
+        for record in self.records.iter().rev() {
+            out.push(MediaPlayed::played(
+                record.media_id.clone(),
+                record.media_type.clone(),
+                record.duration_seconds,
+                record.played_ms,
+            ));
+        }
+        out.truncate(MAX_PLAYED_MEDIA);
+        out
+    }
+
+    /// 记录一首已结束的播放（只留有播放量的）。
+    fn remember(&mut self, current: CurrentPlay) {
+        if current.played_ms <= 0 {
+            return;
+        }
+        self.records.push(PlayedRecord {
+            media_id: current.track_id,
+            media_type: current.media_type,
+            duration_seconds: current.duration_seconds.round() as i64,
+            played_ms: current.played_ms,
+        });
+        let overflow = self.records.len().saturating_sub(MAX_RECORDS);
+        if overflow > 0 {
+            self.records.drain(0..overflow);
+        }
     }
 
     fn report_end(&self, current: CurrentPlay, reason: PlayEndReason) {
@@ -392,5 +463,25 @@ mod tests {
         assert_eq!(reporter.played_ms(), 3000);
         reporter.observe_at(&snapshot("b", 0.0, true), t0 + Duration::from_millis(3000));
         assert_eq!(reporter.played_ms(), 0, "换曲后重新计时");
+    }
+
+    #[test]
+    fn played_media_reports_recent_with_millis() {
+        let mut reporter = PlayReporter::silent(Settings::default());
+        let t0 = Instant::now();
+        reporter.observe_at(&snapshot("a", 0.0, true), t0);
+        reporter.observe_at(&snapshot("a", 1.0, true), t0 + Duration::from_millis(1000));
+        reporter.observe_at(&snapshot("a", 2.0, true), t0 + Duration::from_millis(2000));
+        // 换到 b：a 进入历史记录（3s），b 为当前
+        reporter.observe_at(&snapshot("b", 0.0, true), t0 + Duration::from_millis(3000));
+        reporter.observe_at(&snapshot("b", 1.0, true), t0 + Duration::from_millis(4000));
+        let played = reporter.played_media();
+        assert_eq!(played.len(), 2);
+        // 最近在前：b（当前）在 a（历史）之前
+        assert_eq!(played[0].media_id, "b");
+        assert_eq!(played[0].played_ms, 1000);
+        assert_eq!(played[1].media_id, "a");
+        assert_eq!(played[1].played_ms, 3000);
+        assert_eq!(played[1].duration_seconds, 120);
     }
 }

@@ -84,6 +84,13 @@ pub(crate) fn lyrics_view(root: &Root, window: &Window, cx: &mut Context<Root>) 
         .cloned()
         .or_else(|| root.cover_of(&cover_source));
     let original_cover_ready = root.original_covers.contains_key(&cover_source);
+    // 切曲后的前 200ms 强制显示加载态（即便图在缓存里）。
+    let cover_loading_gate = root
+        .lyrics_cover_gate
+        .as_ref()
+        .map(|(id, at)| id == &track.id && at.elapsed() < std::time::Duration::from_millis(200))
+        .unwrap_or(false);
+    let cover_path = if cover_loading_gate { None } else { cover_path };
     let like_button = div()
         .id("playback-like")
         .flex_none()
@@ -284,14 +291,35 @@ pub(crate) fn lyrics_view(root: &Root, window: &Window, cx: &mut Context<Root>) 
                                 .gap(px(theme::space::LG))
                                 .w(px(cover_size))
                                 .flex_none()
-                                .child(crate::ui::artwork::cover_loading(
-                                    cover_path,
-                                    cover_size,
-                                    theme::radius::CARD,
-                                ))
-                                .when(!original_cover_ready, |this| {
-                                    this.child(retry_button(root.language, cx))
-                                })
+                                .child(
+                                    div()
+                                        .relative()
+                                        .w(px(cover_size))
+                                        .h(px(cover_size))
+                                        .flex_none()
+                                        .child(crate::ui::artwork::cover_loading(
+                                            cover_path,
+                                            cover_size,
+                                            theme::radius::CARD,
+                                        ))
+                                        // 原图加载失败：把重试按钮放进封面内（底部居中），
+                                        // 不再占封面下方一行。
+                                        .when(
+                                            !original_cover_ready && !cover_loading_gate,
+                                            |this| {
+                                                this.child(
+                                                    div()
+                                                        .absolute()
+                                                        .left_0()
+                                                        .right_0()
+                                                        .bottom(px(cover_size * 0.10))
+                                                        .flex()
+                                                        .justify_center()
+                                                        .child(retry_button(root.language, cx)),
+                                                )
+                                            },
+                                        ),
+                                )
                                 .child(track_info),
                         )
                         .child(right_module),

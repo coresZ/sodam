@@ -1,71 +1,94 @@
 //! 封面组件：统一尺寸、统一圆角，缺图时给同色系占位块。
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use gpui::prelude::*;
-use gpui::{div, img, px, svg, AnyElement, IntoElement, ObjectFit};
+use gpui::{div, img, px, svg, AnyElement, ImageSource, Img, IntoElement, ObjectFit, Resource};
 
+use crate::ui::cover_cache::{sample_edge, CoverImageCache};
 use crate::ui::{icons, theme};
 
-/// 渲染封面。
-///
-/// * `path` 是已经下载到本地的封面文件（见 `sodam_core::Session::cover_path`）；
-/// * 没有封面时画一个抬升面 + 音符图标，保证列表行的视觉重量一致，
-///   不会出现「有的行有图、有的行塌成一条线」。
-pub fn cover(path: Option<PathBuf>, size: f32, radius: f32) -> AnyElement {
-    match path.filter(|path| path.exists()) {
-        Some(path) => img(path)
-            .w(px(size))
-            .h(px(size))
-            .flex_none()
-            .rounded(px(radius))
-            .object_fit(ObjectFit::Cover)
-            .into_any_element(),
-        None => div()
-            .w(px(size))
-            .h(px(size))
-            .flex_none()
-            .rounded(px(radius))
-            .bg(theme::surface_elevated())
-            .flex()
-            .items_center()
-            .justify_center()
-            .child(
-                svg()
-                    .path(icons::path("music"))
-                    .size(px((size * 0.42).max(theme::ICON_SM)))
-                    .text_color(theme::text_faint()),
-            )
-            .into_any_element(),
-    }
+/// 封面图源：走自定义缓存（按显示尺寸解码，而非原分辨率）。
+fn cover_img(path: PathBuf, size: f32, radius: f32) -> Img {
+    let resource = Resource::from(path);
+    let source = ImageSource::Custom(Arc::new(move |window, cx| {
+        let edge = sample_edge(size, window.scale_factor());
+        let cache = CoverImageCache::entity(cx);
+        cache.update(cx, |cache, cx| cache.load_at(&resource, edge, window, cx))
+    }));
+    img(source)
+        .w(px(size))
+        .h(px(size))
+        .flex_none()
+        .rounded(px(radius))
+        .object_fit(ObjectFit::Cover)
+}
+
+/// 缺图占位：抬升面 + 音符图标（列表行也要有视觉重量）。
+fn cover_placeholder(size: f32, radius: f32) -> AnyElement {
+    div()
+        .w(px(size))
+        .h(px(size))
+        .flex_none()
+        .rounded(px(radius))
+        .bg(theme::surface_elevated())
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(
+            svg()
+                .path(icons::path("music"))
+                .size(px((size * 0.42).max(theme::ICON_SM)))
+                .text_color(theme::text_faint()),
+        )
+        .into_any_element()
 }
 
 /// 大尺寸封面加载态：背景占位 + 旋转圆圈。
+fn loading_placeholder(size: f32, radius: f32) -> AnyElement {
+    div()
+        .relative()
+        .w(px(size))
+        .h(px(size))
+        .flex_none()
+        .rounded(px(radius))
+        .bg(theme::surface_elevated())
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(
+            div()
+                .absolute()
+                .size(px(size * 0.72))
+                .rounded(px(radius))
+                .bg(theme::surface_hover()),
+        )
+        .child(crate::ui::spinner::spinner(
+            (size * 0.28).max(theme::ICON_LG),
+            theme::text(),
+        ))
+        .into_any_element()
+}
+
+/// 渲染封面。
+///
+/// `path` 是已经下载到本地的封面文件（见 `sodam_core::Session::cover_path`）；
+/// 没有封面时画一个抬升面 + 音符图标。
+pub fn cover(path: Option<PathBuf>, size: f32, radius: f32) -> AnyElement {
+    match path.filter(|path| path.exists()) {
+        Some(path) => cover_img(path, size, radius).into_any_element(),
+        None => cover_placeholder(size, radius),
+    }
+}
+
+/// 大尺寸封面：缺图、以及**解码中**都显示旋转圆圈。
 pub fn cover_loading(path: Option<PathBuf>, size: f32, radius: f32) -> AnyElement {
     match path.filter(|path| path.exists()) {
-        Some(path) => cover(Some(path), size, radius),
-        None => div()
-            .relative()
-            .w(px(size))
-            .h(px(size))
-            .flex_none()
-            .rounded(px(radius))
-            .bg(theme::surface_elevated())
-            .flex()
-            .items_center()
-            .justify_center()
-            .child(
-                div()
-                    .absolute()
-                    .size(px(size * 0.72))
-                    .rounded(px(radius))
-                    .bg(theme::surface_hover()),
-            )
-            .child(crate::ui::spinner::spinner(
-                (size * 0.28).max(theme::ICON_LG),
-                theme::text(),
-            ))
+        Some(path) => cover_img(path, size, radius)
+            .with_loading(move || loading_placeholder(size, radius))
             .into_any_element(),
+        None => loading_placeholder(size, radius),
     }
 }
 

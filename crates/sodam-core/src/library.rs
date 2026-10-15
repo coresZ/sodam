@@ -184,6 +184,7 @@ fn recommended_tracks(value: &serde_json::Value) -> anyhow::Result<Vec<TrackItem
 fn recommended_page(
     session: &Session,
     source: &RecommendationSource,
+    played_media: &[libresoda::MediaPlayed],
 ) -> anyhow::Result<(RecommendationSource, Vec<TrackItem>)> {
     let fetch_counter = source.fetch_counter.saturating_add(1);
     let mut body = serde_json::json!({
@@ -193,6 +194,11 @@ fn recommended_page(
         "is_did_first_request": source.fetch_counter == 0,
         "feed_counts": { "mix_session_count": fetch_counter },
     });
+    // 听歌时长就靠这个上报（最近播过 + 实际播放毫秒）。
+    body["played_media"] = libresoda::media_played_array(played_media);
+    if std::env::var("SODAM_REPORT_LOG").is_ok() {
+        eprintln!("[report] feed played_media={}", body["played_media"]);
+    }
     if let Some(scene) = &source.scene {
         if scene.scene_mode_id >= 0 {
             body["feed_preference"] = serde_json::json!({ "scene_mode_id": scene.scene_mode_id });
@@ -219,8 +225,11 @@ fn recommended_page(
 }
 
 /// 首次加载官方推荐队列。
-pub fn recommended_start(session: &Session) -> anyhow::Result<RecommendedStart> {
-    let (source, tracks) = recommended_page(session, &RecommendationSource::new())?;
+pub fn recommended_start(
+    session: &Session,
+    played_media: &[libresoda::MediaPlayed],
+) -> anyhow::Result<RecommendedStart> {
+    let (source, tracks) = recommended_page(session, &RecommendationSource::new(), played_media)?;
     anyhow::ensure!(!tracks.is_empty(), "推荐队列为空");
     Ok(RecommendedStart { source, tracks })
 }
@@ -229,10 +238,11 @@ pub fn recommended_start(session: &Session) -> anyhow::Result<RecommendedStart> 
 pub fn recommended_scene_start(
     session: &Session,
     scene: SceneItem,
+    played_media: &[libresoda::MediaPlayed],
 ) -> anyhow::Result<RecommendedStart> {
     let mut source = RecommendationSource::new();
     source.scene = Some(scene);
-    let (source, tracks) = recommended_page(session, &source)?;
+    let (source, tracks) = recommended_page(session, &source, played_media)?;
     anyhow::ensure!(!tracks.is_empty(), "该听歌模式队列为空");
     Ok(RecommendedStart { source, tracks })
 }
@@ -512,12 +522,17 @@ pub fn scene_discover_cards_more(
 }
 
 /// 电台探索卡首队：官方 `FeedRadioTracks`。
-pub fn radio_tracks(session: &Session, radio: &RadioSource) -> anyhow::Result<Vec<TrackItem>> {
+pub fn radio_tracks(
+    session: &Session,
+    radio: &RadioSource,
+    played_media: &[libresoda::MediaPlayed],
+) -> anyhow::Result<Vec<TrackItem>> {
     let body = serde_json::json!({
         "radio_id": radio.radio_id,
         "cursor": "",
         "flow_type": radio.flow_type,
         "trigger_info": radio.trigger_info,
+        "played_media": libresoda::media_played_array(played_media),
     });
     let value = session
         .soda()
@@ -532,8 +547,9 @@ pub fn radio_tracks(session: &Session, radio: &RadioSource) -> anyhow::Result<Ve
 pub fn recommended_append(
     session: &Session,
     source: &RecommendationSource,
+    played_media: &[libresoda::MediaPlayed],
 ) -> anyhow::Result<RecommendedBatch> {
-    let (source, tracks) = recommended_page(session, source)?;
+    let (source, tracks) = recommended_page(session, source, played_media)?;
     anyhow::ensure!(!tracks.is_empty(), "推荐队列没有追加到新曲目");
     Ok(RecommendedBatch { source, tracks })
 }

@@ -639,6 +639,8 @@ pub struct Root {
     pub(crate) last_finished_seq: u64,
     /// 拖动进度条时的预览位置（0.0~1.0）：拖动中只改它，松手才真跳。
     pub progress_preview: Option<f32>,
+    /// 歌词页大封面：切曲后的 `(track_id, 开始时刻)`；管「至少 200ms 加载态」的门。
+    pub lyrics_cover_gate: Option<(String, std::time::Instant)>,
     /// 队列快照（含版本号）：避免抽屉每帧深拷贝整条队列。
     pub queue_cache: (u64, Arc<Vec<TrackItem>>),
     /// 已尝试过的封面 URL（成功在 covers 里，失败的也记下来，避免每帧重复排队）。
@@ -647,8 +649,6 @@ pub struct Root {
     /// 绝不在 render 里发网络请求（否则主线程会被下载卡住）。
     pub covers: Arc<HashMap<String, PathBuf>>,
     pub original_covers: HashMap<String, PathBuf>,
-    /// 封面图片缓存：有上界，淘汰时把图从 gpui 的图集里释放（不设这个就会无界增长）。
-    pub cover_cache: gpui::Entity<ui::cover_cache::CoverImageCache>,
     pub original_cover_attempted: Arc<Mutex<HashSet<String>>>,
     pub ambient_colors: HashMap<String, (u8, u8, u8)>,
     pub(crate) cover_pool: CoverPool,
@@ -873,11 +873,11 @@ impl Root {
             pending_track: None,
             last_finished_seq: 0,
             progress_preview: None,
+            lyrics_cover_gate: None,
             queue_cache: (0, Arc::new(Vec::new())),
             cover_attempted: Arc::new(Mutex::new(HashSet::new())),
             cover_requests: Arc::new(Mutex::new(Vec::new())),
             covers: Arc::new(HashMap::new()),
-            cover_cache: ui::cover_cache::CoverImageCache::new(cx),
             original_covers: HashMap::new(),
             original_cover_attempted: Arc::new(Mutex::new(HashSet::new())),
             ambient_colors: HashMap::new(),
@@ -1286,6 +1286,24 @@ impl Render for Root {
                 self.lyrics_scroll
                     .scroll_to_item_strict(index, gpui::ScrollStrategy::Center);
             }
+            // 切曲后强制大封面显示至少 200ms 的加载态（即便图已在缓存里）。
+            if let Some(track) = self.queue.current() {
+                let fresh = self
+                    .lyrics_cover_gate
+                    .as_ref()
+                    .map(|(id, _)| id != &track.id)
+                    .unwrap_or(true);
+                if fresh {
+                    self.lyrics_cover_gate = Some((track.id.clone(), std::time::Instant::now()));
+                    cx.spawn(async move |this, cx| {
+                        cx.background_executor()
+                            .timer(std::time::Duration::from_millis(220))
+                            .await;
+                        let _ = this.update(cx, |_, cx| cx.notify());
+                    })
+                    .detach();
+                }
+            }
         }
         let element = div()
             .relative()
@@ -1295,12 +1313,6 @@ impl Render for Root {
             // 根元素持焦点 + 挂基础上下文：带谓词的快捷键绑定要有非空上下文栈才生效。
             .track_focus(&self.workspace_focus)
             .key_context(crate::shortcuts::BASE_CONTEXT)
-            // macOS 隐藏系统标题栏，顶部留出红绿灯的高度；
-            // Windows 隐藏系统标题栏后由应用自绘拖拽区与控制按钮。
-            .when(cfg!(target_os = "macos"), |this| this.pt(px(28.0)))
-            .when(cfg!(target_os = "windows"), |this| {
-                this.child(ui::titlebar::render())
-            })
             .bg(theme::ambient_background())
             .text_color(ui::theme::text())
             .child(
@@ -1315,6 +1327,12 @@ impl Render for Root {
                         div()
                             .flex_1()
                             .min_w(px(0.0))
+                            // macOS：让红绿灯悬浮在内容之上，内容整体下移 28px。
+                            .when(cfg!(target_os = "macos"), |this| this.pt(px(28.0)))
+                            // Windows：只下移内容，根背景和侧栏仍铺到标题栏顶部。
+                            .when(cfg!(target_os = "windows"), |this| {
+                                this.pt(px(ui::titlebar::STRIP_HEIGHT))
+                            })
                             .child(views::render(self, window, cx)),
                     )
                     // 右侧面板**叠加**在内容之上，而不是挤压内容区。
@@ -1353,6 +1371,11 @@ impl Render for Root {
                     }),
             )
             .child(ui::player_bar::render(self, cx))
+            // 标题栏覆盖在各面板背景之上；不再单独占一行而截断侧栏底色。
+            // 放在普通内容之后、弹层之前，控制按钮可点击，弹层仍能覆盖标题栏。
+            .when(cfg!(target_os = "windows"), |this| {
+                this.child(ui::titlebar::render())
+            })
             .when(self.track_menu.is_some(), |this| {
                 this.child(crate::views::track_menu(self, cx))
             })
@@ -1410,10 +1433,6 @@ impl Render for Root {
                 eprintln!("[frame] {elapsed}ms nav={:?} rows={rows}", self.nav);
             }
         }
-        // 给整棵子树挂上有上界的封面图片缓存：超预算的封面会被释放，
-        // 不挂的话每张见过的封面都会永远留在显存里（见 ui/cover_cache.rs）。
-        gpui::image_cache(self.cover_cache.clone())
-            .size_full()
-            .child(element)
+        element
     }
 }

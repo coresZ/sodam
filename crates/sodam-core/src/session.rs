@@ -363,6 +363,9 @@ impl Session {
         let quality = describe_quality(&info);
         std::fs::rename(&part, &path).map_err(|err| anyhow::anyhow!("缓存落盘失败: {err}"))?;
         let _ = std::fs::write(&quality_path, format!("{quality}\t{written}"));
+        // 无损整曲下载 + 解密会在内存里同时持有加密数据、明文、mdat 多份缓冲，
+        // 结束后把已释放的页归还系统，避免 macOS malloc 保留导致 RSS 长期虚高。
+        crate::mem::release_malloc_pressure();
         Ok(CachedTrack { path, quality })
     }
 

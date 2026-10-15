@@ -1326,7 +1326,8 @@ pub fn render(root: &Root, window: &Window, cx: &mut Context<Root>) -> impl Into
         .flex()
         .flex_col()
         .size_full()
-        .bg(theme::ambient_background())
+        // 不重复画渐变：背景统一由根元素（整窗尺寸）负责，
+        // 否则内容区渐变从自身顶部重新起算，会在标题栏下沿出现色差横缝。
         .p(px(theme::space::XL))
         .gap(px(theme::space::LG))
         .when(

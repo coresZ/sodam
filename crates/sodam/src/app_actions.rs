@@ -897,8 +897,13 @@ impl Root {
         cx.notify();
 
         let settings = self.settings.clone();
+        let played_media = self.play_reporter.played_media();
         let work = cx.background_spawn(async move {
-            sodam_core::library::recommended_scene_start(&Session::new(settings), scene)
+            sodam_core::library::recommended_scene_start(
+                &Session::new(settings),
+                scene,
+                &played_media,
+            )
         });
         cx.spawn(async move |this, cx| {
             let result = work.await;
@@ -1120,8 +1125,9 @@ impl Root {
         cx.notify();
 
         let settings = self.settings.clone();
+        let played_media = self.play_reporter.played_media();
         let work = cx.background_spawn(async move {
-            sodam_core::library::recommended_start(&Session::new(settings))
+            sodam_core::library::recommended_start(&Session::new(settings), &played_media)
         });
         cx.spawn(async move |this, cx| {
             let result = work.await;
@@ -1178,9 +1184,10 @@ impl Root {
                 cx.notify();
 
                 let settings = self.settings.clone();
+                let played_media = self.play_reporter.played_media();
                 let work = cx.background_spawn(async move {
                     let session = Session::new(settings);
-                    sodam_core::library::radio_tracks(&session, &radio)
+                    sodam_core::library::radio_tracks(&session, &radio, &played_media)
                 });
                 cx.spawn(async move |this, cx| {
                     let result = work.await;
@@ -1303,8 +1310,9 @@ impl Root {
         cx.notify();
 
         let settings = self.settings.clone();
+        let played_media = self.play_reporter.played_media();
         let work = cx.background_spawn(async move {
-            sodam_core::library::recommended_append(&Session::new(settings), &source)
+            sodam_core::library::recommended_append(&Session::new(settings), &source, &played_media)
         });
         cx.spawn(async move |this, cx| {
             let result = work.await;

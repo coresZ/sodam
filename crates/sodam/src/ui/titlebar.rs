@@ -15,7 +15,7 @@ use gpui::{div, hsla, px, svg, Div, Hsla, WindowControlArea};
 use crate::ui::{icons, theme};
 
 /// 标题栏条高度（逻辑像素，与 Windows 惯例一致）。
-const STRIP_HEIGHT: f32 = 32.0;
+pub const STRIP_HEIGHT: f32 = 32.0;
 /// 单个标题栏按钮宽度。
 const BUTTON_WIDTH: f32 = 44.0;
 /// 控制图标边长。
@@ -23,14 +23,20 @@ const GLYPH_SIZE: f32 = 12.0;
 /// 关闭按钮悬停色（Windows 惯例红）。
 const CLOSE_HOVER: Hsla = hsla(4.0 / 360.0, 0.83, 0.49, 1.0);
 
-/// 渲染标题栏条：左侧全部为拖拽区，右侧是三个窗口控制按钮。
+/// 覆盖在窗口顶部，不占布局高度：侧边栏/内容列各自为控件留出空间，
+/// 背景仍延伸到标题栏下方，避免独立标题栏横条与面板之间出现色差。
+/// 左侧全部为拖拽区，右侧是三个窗口控制按钮。
 pub fn render() -> Div {
     div()
+        .absolute()
+        .top(px(0.0))
+        .left(px(0.0))
         .flex()
         .flex_row()
         .items_center()
         .w_full()
         .h(px(STRIP_HEIGHT))
+        .flex_none()
         .child(drag_area())
         .child(caption_button(
             "titlebar-min",
@@ -93,5 +99,21 @@ fn caption_button(
         base.hover(|style| style.bg(CLOSE_HOVER))
     } else {
         base.hover(|style| style.bg(theme::surface_hover()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn titlebar_overlays_panel_backgrounds_without_its_own_fill() {
+        let mut titlebar = render();
+        let style = titlebar.style();
+        assert_eq!(style.position, Some(gpui::Position::Absolute));
+        assert_eq!(style.inset.top, Some(px(0.0).into()));
+        assert_eq!(style.inset.left, Some(px(0.0).into()));
+        assert_eq!(style.size.height, Some(px(STRIP_HEIGHT).into()));
+        assert!(style.background.is_none());
     }
 }

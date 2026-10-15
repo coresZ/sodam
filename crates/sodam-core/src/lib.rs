@@ -10,6 +10,7 @@ pub mod download_library;
 pub mod library;
 pub mod login;
 pub mod match_metadata;
+pub mod mem;
 pub mod models;
 pub mod paths;
 pub mod play_report;
