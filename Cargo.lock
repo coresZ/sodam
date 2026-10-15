@@ -6109,7 +6109,7 @@ dependencies = [
 
 [[package]]
 name = "sodam"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "futures-lite",
@@ -6129,7 +6129,7 @@ dependencies = [
 
 [[package]]
 name = "sodam-core"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "dirs 6.0.0",

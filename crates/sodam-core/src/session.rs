@@ -162,6 +162,16 @@ fn is_truncated_download(declared: i64, written: u64) -> bool {
     declared > 0 && written < declared as u64
 }
 
+/// 刷新缓存文件的 mtime，作为 LRU 的「最近使用」信号。
+///
+/// 失败一律忽略：拿不到 mtime 只会让这首在淘汰时按更旧的顺序排，不影响正确性
+/// （Windows 上对以只读方式打开的句柄调 `set_modified` 可能失败）。
+fn touch_cache_file(path: &std::path::Path) {
+    if let Ok(file) = std::fs::File::open(path) {
+        let _ = file.set_modified(std::time::SystemTime::now());
+    }
+}
+
 /// 一次进程内共享的会话（持有 `Soda` 与当前设置）。
 pub struct Session {
     pumpkin: Soda,
@@ -333,6 +343,8 @@ impl Session {
         // sidecar 记录「音质标签 + 实际字节数」，用于命中时的大小校验。
         let quality_path = dir.join(format!("{0}-{tag}.quality", track.id));
         if let Some(cached) = self.cached_track(&track.id) {
+            // LRU：命中都算一次「使用」（播放或预取），刷新 mtime 让淘汰时排到后面。
+            touch_cache_file(&cached.path);
             return Ok(cached);
         }
 
@@ -363,6 +375,15 @@ impl Session {
         let quality = describe_quality(&info);
         std::fs::rename(&part, &path).map_err(|err| anyhow::anyhow!("缓存落盘失败: {err}"))?;
         let _ = std::fs::write(&quality_path, format!("{quality}\t{written}"));
+        // 落盘后按上限淘汰旧缓存（LRU）。这里是后台阻塞上下文，淘汰同步做也无妨；
+        // `path` 是最新的、本来就不会被选中，显式保护它是为了「上限小于单曲」的极端配置。
+        let evicted = crate::cache::enforce_cache_limit(&self.settings.cache, Some(&path));
+        if evicted.removed_files > 0 && std::env::var("SODAM_CACHE_LOG").is_ok() {
+            eprintln!(
+                "[cache] 淘汰 {} 个缓存文件，释放 {} 字节",
+                evicted.removed_files, evicted.freed_bytes
+            );
+        }
         // 无损整曲下载 + 解密会在内存里同时持有加密数据、明文、mdat 多份缓冲，
         // 结束后把已释放的页归还系统，避免 macOS malloc 保留导致 RSS 长期虚高。
         crate::mem::release_malloc_pressure();

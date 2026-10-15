@@ -927,3 +927,83 @@ GPUI 的 deferred 按**优先级升序** prepaint / paint，鼠标冒泡按**注
   `open_lyrics()` 覆盖（既有 dev 工具竞态，与本次合并无关），截图核对以
   手动点击侧边栏为准。
 
+## 2026-10-16 — 修复：下载失败标签数字错位 + 播放缓存上限（LRU）
+
+用户反馈两件事，先验证再改：下载失败列表无数据却显示数字；缓存希望可限制大小。
+
+### 问题 1：下载失败 tab 的数字挂错分区（`crates/sodam/src/views/downloads.rs`）
+
+**根因**：面板 tab 数量数组的顺序与 `DownloadTab::ALL` 不一致。
+
+```rust
+// 旧（bug）：ALL = [Active, Failed, Completed]，这里却是 [active, completed, failed]
+let tab_counts = [counts.active(), counts.completed, counts.failed + counts.cancelled];
+```
+
+于是「下载失败」标签拿到的是**已完成**数、「已下载」标签拿到的是**失败+取消**数 ——
+下载成功后失败标签挂着数字、点进去却是空的。列表过滤本身没错（`is_failed` 已含
+Cancelled），错的只是徽章。
+
+**修法**：删掉这个数组，改成按 tab 取值的 `tab_count(counts, tab)`，顺序不再能对错。
+新增回归测试 `views::downloads::tests::tab_counts_match_each_partition`。
+
+### 问题 2：新增播放缓存上限（LRU）
+
+- **`crates/sodam-core/src/cache.rs`（新增）**
+  - `CacheSettings { limit_mb }`（`0` = 不限，默认）+ `limit_bytes()` / `threshold_bytes()`
+    （高水位 = 上限 × 85%）。
+  - `enforce_cache_limit(settings, protect)` / `evict_to_threshold(dir, threshold, protect)`：
+    只扫**播放缓存目录**（`cache/audio`），把占用淘汰到阈值以下；LRU 依据是文件 mtime。
+    淘汰单位是**整首歌**（`<id>-<tag>.m4a` + 其 `.quality` 边车），`.part` 不参与；
+    删不掉（Windows 上被占用）就跳过；`protect`（刚写入 / 正在播放）永不删。
+  - 5 个单测：不限为 no-op、阈值 = 85%、LRU 删到阈值以下且成对删除、受保护文件不删、
+    未超阈值不动。
+- **`crates/sodam-core/src/config.rs`**：`Settings` 新增 `cache: CacheSettings`；
+  新增往返 / 老配置回退测试，并断言它**不进 `fingerprint()`**（纯本地项）。
+- **`crates/sodam-core/src/lib.rs`**：导出 `cache` 模块与 `CacheSettings`。
+- **`crates/sodam-core/src/session.rs`**
+  - `download_to_cache` 命中缓存时 `touch_cache_file`（刷新 mtime，作为 LRU 最近使用信号）。
+  - 落盘成功后调用 `enforce_cache_limit(&self.settings.cache, Some(&path))`（已在后台阻塞
+    上下文；显式保护刚写的文件，防「上限小于单曲」的极端配置）。`SODAM_CACHE_LOG=1`
+    时打印淘汰结果。
+- **`crates/sodam/src/app_actions.rs`**：新增 `apply_cache_settings` —— 保存配置并在后台
+  按新上限淘汰一次（不必等下一首下载），完成后刷新设置页占用统计。
+- **`crates/sodam/src/views/settings.rs`**：「缓存」区新增「播放缓存上限」`segmented`
+  （不限 / 1 / 2 / 5 / 10 / 20 GB）；任意值改 `config.json` 的 `cache.limit_mb`。
+- **`crates/sodam/src/ui/i18n.rs`**：新增 4 条英文（播放缓存上限 / 说明 / 不限 / 已保存）。
+
+### 顺带修：`clear_cache` 漏删封面原图（`crates/sodam-core/src/audio.rs`）
+
+`clear_cache()` 原先只删各缓存目录的**顶层文件**，而封面原图在 `covers/original/`
+子目录里 —— 清不掉；但 `cache_stats()` 是**递归**统计，于是「清空缓存」后封面占用
+数字不变（清 / 统计口径不一致）。改为 `remove_files_recursive`（递归；不跟进符号链接）。
+
+### 影响面与已知取舍
+
+- 缓存上限**只管播放缓存**：封面缓存与下载目录（`down/`）都不受影响；内存里的解码
+  封面缓存本就有上界（`cover_cache.rs`，16MB / 256 条）。
+- LRU 用 mtime：命中刷新失败（如只读句柄）时退化为 FIFO，不影响正确性。
+- 上限默认 `0`（不限），行为与改动前一致；只有用户显式设定后才淘汰。
+- 新增/改动与下载设置同构：预设在 UI、任意值走 `config.json`（与下载目录 / 命名模板
+  的既有约定一致）。
+
+### 验证（Windows x64，`CARGO_BUILD_JOBS=6`）
+
+- `cargo check --offline -p sodam-core` / `-p sodam`：通过。
+- `cargo fmt --all -- --check`：通过。
+- `cargo clippy --offline -p sodam-core -p sodam --all-targets -- -D warnings`：通过
+  （先修掉 `derivable_impls` 与 `sort_by_key` 两条）。
+- `cargo test --offline -p sodam-core`：**88** 通过（原 81 + cache 5 + config 1 + 既有）；
+  `-p sodam`：**22** 通过（含新增 tab 计数回归）。
+- **UI 未做真机验证**（本机无桌面截图手段）：设置页新增的「播放缓存上限」分段控件
+  需要人工过一眼。
+### 版本与提交
+
+- 版本 `0.3.0` → `0.3.1`：`Cargo.toml`（workspace 版本）与 `packaging/arch/PKGBUILD`（`pkgver`）；
+  `Cargo.lock` 由构建自动刷新。README 里的 `v0.3.0` 下载示例指向**已发布的 Release 产物**，
+  在真正发版前保持不动。
+- `cargo build --offline -p sodam` 重建 `target/debug/sodam.exe`：`cargo check` / `cargo test`
+  不更新二进制，`scripts/run.sh` 跑的是旧 exe（本次踩过）。
+- 本次改动提交并推送至 `origin/feat/0.3.0`。
+
+

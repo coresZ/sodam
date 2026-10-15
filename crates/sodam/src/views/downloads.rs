@@ -8,7 +8,7 @@ use gpui::{
     div, px, svg, uniform_list, AnyElement, ClickEvent, Context, IntoElement, SharedString,
 };
 
-use sodam_core::download::{human_eta, human_speed, DownloadState, DownloadTask};
+use sodam_core::download::{human_eta, human_speed, DownloadCounts, DownloadState, DownloadTask};
 
 use crate::app::{DownloadTab, Root};
 use crate::ui::artwork::cover;
@@ -277,6 +277,20 @@ pub(crate) fn task_row(
         .into_any_element()
 }
 
+/// 某个分区标签应显示的数量。
+///
+/// **必须与 [`DownloadTab::matches`] 的过滤条件一一对应**：标签上的数字和点进去
+/// 看到的行数必须同源。曾经这里按 `[active, completed, failed]` 的顺序往数组里填，
+/// 而 `DownloadTab::ALL` 的顺序是 `[Active, Failed, Completed]` —— 「下载失败」标签
+/// 挂的是已完成数、点进去却是空的（用户实测反馈）。改成按 tab 取值，顺序不再能对错。
+fn tab_count(counts: &DownloadCounts, tab: DownloadTab) -> usize {
+    match tab {
+        DownloadTab::Active => counts.active(),
+        DownloadTab::Failed => counts.failed + counts.cancelled,
+        DownloadTab::Completed => counts.completed,
+    }
+}
+
 /// 分区标签（带数量）。
 fn tab_button(
     language: Language,
@@ -392,19 +406,13 @@ pub fn panel(root: &Root, width: f32, cx: &mut Context<Root>) -> impl IntoElemen
     // 全部暂停后 active 仍然 > 0（那些行是 paused），只看它按钮就永远停在「全部暂停」。
     let pending = counts.pending();
 
-    let tab_counts = [
-        counts.active(),
-        counts.completed,
-        counts.failed + counts.cancelled,
-    ];
     let tabs: Vec<AnyElement> = DownloadTab::ALL
         .iter()
-        .enumerate()
-        .map(|(index, tab)| {
+        .map(|tab| {
             tab_button(
                 language,
                 *tab,
-                tab_counts.get(index).copied().unwrap_or(0),
+                tab_count(&counts, *tab),
                 *tab == root.download_tab,
                 cx,
             )
@@ -547,4 +555,29 @@ pub fn panel(root: &Root, width: f32, cx: &mut Context<Root>) -> impl IntoElemen
                         })),
                 )
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tab_count;
+    use crate::app::DownloadTab;
+    use sodam_core::download::DownloadCounts;
+
+    /// 回归：分区标签的数量必须与该分区列表的过滤结果同源。
+    /// 曾经标签按 `[active, completed, failed]` 填数组，而 `DownloadTab::ALL` 的顺序是
+    /// `[Active, Failed, Completed]` —— 「下载失败」挂的是已完成数，点进去却是空的。
+    #[test]
+    fn tab_counts_match_each_partition() {
+        let counts = DownloadCounts {
+            queued: 1,
+            running: 2,
+            paused: 3,
+            completed: 10,
+            failed: 4,
+            cancelled: 5,
+        };
+        assert_eq!(tab_count(&counts, DownloadTab::Active), 6); // queued+running+paused
+        assert_eq!(tab_count(&counts, DownloadTab::Failed), 9); // failed+cancelled
+        assert_eq!(tab_count(&counts, DownloadTab::Completed), 10);
+    }
 }

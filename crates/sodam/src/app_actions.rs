@@ -1432,6 +1432,32 @@ impl Root {
         .detach();
     }
 
+    /// 设置页保存播放缓存上限；顺带在后台按新上限淘汰一次（不必等下一首下载才生效）。
+    pub(crate) fn apply_cache_settings(&mut self, limit_mb: u64, cx: &mut Context<Self>) {
+        self.settings.cache.limit_mb = limit_mb;
+        match self.settings.save() {
+            Ok(()) => self.status = self.tr("缓存设置已保存").to_string(),
+            Err(err) => self.status = self.localized("保存失败：{err}", &[err.to_string()]),
+        }
+        let settings = self.settings.cache.clone();
+        // 一调低上限就立刻收敛（同样是后台阻塞 I/O）；完成后刷新占用统计。
+        if settings.limit_bytes().is_some() {
+            let work = cx.background_spawn(async move {
+                sodam_core::cache::enforce_cache_limit(&settings, None)
+            });
+            cx.spawn(async move |this, cx| {
+                let _ = work.await;
+                let _ = this.update(cx, |root, cx| {
+                    root.refresh_cache_stats(cx);
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
+        self.refresh_cache_stats(cx);
+        cx.notify();
+    }
+
     /// 后台重扫本地目录，一次刷新两样东西：「已下载」标记 + 本地音乐库。
     ///
     /// 与 [`Self::refresh_cache_stats`] 同理：扫描是阻塞 I/O，绝不能进渲染路径。

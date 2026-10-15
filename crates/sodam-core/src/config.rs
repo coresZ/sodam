@@ -1,5 +1,6 @@
 //! 应用配置（`~/.config/sodam/config.json`）。
 
+use crate::cache::CacheSettings;
 use crate::download::DownloadSettings;
 use serde::{Deserialize, Serialize};
 use std::hash::{Hash, Hasher};
@@ -34,6 +35,8 @@ pub struct Settings {
     pub shortcut_next: String,
     /// 下载设置（音质 / 目录 / 命名 / 并发…）；老配置缺这一段时用默认值。
     pub download: DownloadSettings,
+    /// 播放缓存设置（上限…）；老配置缺这一段时用默认值。
+    pub cache: CacheSettings,
 }
 
 /// 播放控制快捷键的内置默认值。
@@ -93,6 +96,7 @@ impl Default for Settings {
             shortcut_previous: String::new(),
             shortcut_next: String::new(),
             download: DownloadSettings::default(),
+            cache: CacheSettings::default(),
         }
     }
 }
@@ -346,6 +350,30 @@ mod tests {
         };
         settings.save_to(&path).expect("save");
         assert_eq!(Settings::load_from(&path).download, settings.download);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 缓存上限：老配置缺 `cache` 块时用默认值（不限），且能随配置一起往返；
+    /// 它是纯本地项，不能影响会话指纹。
+    #[test]
+    fn cache_settings_round_trip_and_legacy_defaults() {
+        let parsed: Settings = serde_json::from_str(r#"{"cookie":"x"}"#).expect("老配置应能解析");
+        assert_eq!(parsed.cache, CacheSettings::default());
+        assert_eq!(parsed.cache.limit_mb, 0);
+
+        let dir = std::env::temp_dir().join(format!("sodam-cfg-cache-{}", std::process::id()));
+        let path = dir.join("config.json");
+        let settings = Settings {
+            cache: CacheSettings { limit_mb: 2048 },
+            ..Default::default()
+        };
+        settings.save_to(&path).expect("save");
+        assert_eq!(Settings::load_from(&path).cache.limit_mb, 2048);
+        assert_eq!(
+            Settings::default().fingerprint(),
+            settings.fingerprint(),
+            "缓存上限是本地项，不该进入会话指纹"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

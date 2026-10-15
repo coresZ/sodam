@@ -506,6 +506,21 @@ pub(crate) fn settings_view(root: &Root, cx: &mut Context<Root>) -> AnyElement {
             // 缓存：显示占用大小 + 一键清理（统计读后台快照，不在渲染路径扫盘）
             let (audio_bytes, audio_files, cover_bytes, cover_files) = root.cache_summary;
             let total = audio_bytes + cover_bytes;
+            // 上限：预设档位（任意值可在 config.json 的 `cache.limit_mb` 里改）。
+            let limit_control = segmented(
+                "cache-limit",
+                vec![
+                    (0u64, root.tr("不限").to_string()),
+                    (1024, "1 GB".to_string()),
+                    (2048, "2 GB".to_string()),
+                    (5120, "5 GB".to_string()),
+                    (10240, "10 GB".to_string()),
+                    (20480, "20 GB".to_string()),
+                ],
+                &root.settings.cache.limit_mb,
+                |value: u64, root, cx| root.apply_cache_settings(value, cx),
+                cx,
+            );
             div()
                 .flex()
                 .flex_col()
@@ -567,6 +582,12 @@ pub(crate) fn settings_view(root: &Root, cx: &mut Context<Root>) -> AnyElement {
                         }))
                         .child(root.tr("清除歌曲缓存")),
                 )
+                .child(setting_row(
+                    root.tr("播放缓存上限").to_string(),
+                    root.tr("达到上限的 85% 起按最近最少使用淘汰旧缓存；0 = 不限")
+                        .to_string(),
+                    limit_control,
+                ))
         })
         .child(
             div()

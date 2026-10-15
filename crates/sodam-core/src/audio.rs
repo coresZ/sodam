@@ -455,17 +455,36 @@ pub fn cache_stats() -> (u64, usize, u64, usize) {
 }
 
 /// 清空缓存（音频 + 封面），返回删除的文件数。
+///
+/// **递归删除**：封面原图在 `covers/original/` 子目录里，只删顶层会把它们漏掉
+/// —— 而 [`cache_stats`] 是递归统计的，清完占用数字不变就是这里对不上。
+/// 单个文件删不掉（被占用 / 权限）不影响其它文件，静默跳过。
 pub fn clear_cache() -> usize {
     let mut removed = 0usize;
     for dir in [cache_dir(), cover_cache_dir()] {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
+        removed += remove_files_recursive(&dir);
+    }
+    removed
+}
+
+/// 删除目录（含子目录）里的**文件**，返回删除成功数；目录本身保留。
+///
+/// 用 `DirEntry::file_type()` 判定（不跟进符号链接）：指向目录的符号链接不会被
+/// 递归进去，而是当成普通文件删掉链接本身。
+fn remove_files_recursive(dir: &std::path::Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut removed = 0usize;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
             continue;
         };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_file() && std::fs::remove_file(&path).is_ok() {
-                removed += 1;
-            }
+        if file_type.is_dir() {
+            removed += remove_files_recursive(&path);
+        } else if std::fs::remove_file(&path).is_ok() {
+            removed += 1;
         }
     }
     removed

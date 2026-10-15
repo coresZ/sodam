@@ -283,6 +283,12 @@ impl Language {
                 "Total {} ({} songs {}, {} covers {})"
             }
             "清除歌曲缓存" => "Clear Song Cache",
+            "播放缓存上限" => "Playback cache limit",
+            "达到上限的 85% 起按最近最少使用淘汰旧缓存；0 = 不限" => {
+                "Evict least-recently-used above 85% of the limit; 0 = unlimited"
+            }
+            "不限" => "Unlimited",
+            "缓存设置已保存" => "Cache settings saved",
             "其他" => "Other",
             "签名服务：{}" => "Signer: {}",
             "（未配置）" => "(not configured)",
