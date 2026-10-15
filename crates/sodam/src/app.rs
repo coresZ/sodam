@@ -199,7 +199,7 @@ pub enum LocalTab {
     Songs,
     /// 下载管理：**以记录为准** —— 本应用的下载任务与下载记录。
     Downloads,
-    /// 扫描本地音乐。本次只放占位入口，扫描能力见 `plan.md` 的 B 阶段。
+    /// 扫描本地音乐。本次只放占位入口，扫描能力见 `design-plan.md` 的 B 阶段。
     Scan,
 }
 

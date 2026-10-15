@@ -665,7 +665,7 @@ fn task_detail(task: &DownloadTask, language: Language) -> String {
 // 扫描本地音乐（占位）
 // ---------------------------------------------------------------------------
 
-/// 占位入口：扫描任意本地文件夹需要音频标签解析能力（见 `plan.md` 的 B 阶段）。
+/// 占位入口：扫描任意本地文件夹需要音频标签解析能力（见 `design-plan.md` 的 B 阶段）。
 fn scan_placeholder(root: &Root) -> AnyElement {
     div()
         .flex()

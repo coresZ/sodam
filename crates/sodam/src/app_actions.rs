@@ -2081,7 +2081,7 @@ impl Root {
     /// 批量匹配：把所有缺元数据的本地文件逐个匹配，直到全部处理完。
     ///
     /// **串行 + 限速**（每首之间歇一下）：批量匹配会打搜索接口，
-    /// 并发或全速会把签名服务打爆（`plan.md` 里记过同类教训）。
+    /// 并发或全速会把签名服务打爆（`MODIFICATIONS.md` 里记过同类教训）。
     /// 每完成一首就刷新一次列表 —— 用户能看着条目一个个「长」出元数据。
     pub fn match_all_local_files(&mut self, cx: &mut Context<Self>) {
         if self.matching.is_some() {

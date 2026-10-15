@@ -2,7 +2,7 @@
 
 记录本仓库的修改类操作、验证基线与已知取舍。动代码前先读这里。
 
-> 未完成的工作与需注意事项记在 [`plan.md`](plan.md)；能力清单见 [`docs/ROADMAP.md`](docs/ROADMAP.md)。
+> 未完成的工作与需注意事项记在 [`design-plan.md`](design-plan.md)；能力清单见 [`docs/ROADMAP.md`](docs/ROADMAP.md)。
 
 ## 验证基线
 
@@ -53,7 +53,7 @@ cargo test --offline --workspace
 
 ## 2026-10-13 — 下载功能（Phase 1 + 2 + 3）
 
-对齐 `sodam-download-design.md`：单曲下载、歌单 / 专辑批量下载、下载管理面板、下载设置。
+对齐 `design-plan.md`（下载设计稿）：单曲下载、歌单 / 专辑批量下载、下载管理面板、下载设置。
 
 ### sodam-core（领域层，无 GPUI）
 
@@ -368,7 +368,7 @@ VIP 徽章紧跟标题之后，标题一变窄，VIP 的 x 就跟着移动。
     大小 / 音质，点击从该行开始播放。
   - **下载管理**：**以记录为准**，内含 `DownloadTab::{Active, Failed, Completed}` 三个子 tab
     （下载中 / 下载失败 / 已下载）。
-  - **扫描本地音乐**：占位入口（能力见 `plan.md` B 阶段）。
+  - **扫描本地音乐**：占位入口（能力见 `design-plan.md` 的 B 阶段）。
   - 缺 `track_id` 的条目（后续扫描来的）还原不出 `TrackItem`，**不给点击态**，不伪装可点。
 - **`crates/sodam/src/views/mod.rs`**：`subtitles_for` 与 `render` 补 `Nav::Local`；
   `downloads::human_bytes` / `row_labels` / `task_row` / `RowLabels` 提为 `pub(crate)` 以便复用。
@@ -815,4 +815,22 @@ GPUI 的 deferred 按**优先级升序** prepaint / paint，鼠标冒泡按**注
   「选择匹配」浮层（Yang → top-5 候选：Vicky Salamor / JKING8 / Rita Sugiarto /
   Rasti / Andysan，按排名显示、无分数）。
 - `fmt --check` / `clippy -D warnings` / `test`（96 个）/ `build --offline -p sodam` 全绿。
+
+## 2026-10-15 — 文档整理：design-plan.md（合并设计稿未完成项与 plan.md）
+
+用户要求把 `sodam-download-design.md` 的**未完成项**与 `plan.md` 的后续计划合并为
+`design-plan.md`，并清理两份原文件。执行：
+
+- 新增 `design-plan.md`（仓库根）：下载设计稿未完成项（9 条）+ 后续计划（M2 / M3 /
+  B 阶段 / 断点续传）+ 注意事项（含全部已决定项）+ 环境与流程备注 + libresoda
+  下载 API 速查附录。
+- 删除 `sodam-download-design.md`（未跟踪）与 `plan.md`（已跟踪；删除在工作区，
+  随下次提交生效）。
+- 全仓库引用改指 `design-plan.md`：本文件（头部 + 两处正文）、`docs/ROADMAP.md`、
+  `crates/sodam-core/src/download.rs`、`crates/sodam/src/app.rs`、`app_actions.rs`、
+  `views/local_music.rs` 的注释。
+- 顺带核对并写入新文档：`start_track` 的本地命中按 `track_id` 对所有播放入口生效
+  （旧记录「仅本地音乐 / 已下载两个列表」与代码不符，待真机复验后统一）；`Root::status`
+  全 crate 无渲染点（已核实），全局提示目前没有出口。
+- 纯文档 / 注释改动，无行为变化；`fmt --all -- --check` 通过（其余编译门未跑）。
 
