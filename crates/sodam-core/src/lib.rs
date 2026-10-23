@@ -7,10 +7,14 @@ pub mod cache;
 pub mod color;
 pub mod config;
 pub mod contributors;
+pub mod download;
+pub mod download_library;
 pub mod library;
 pub mod login;
+pub mod match_metadata;
 pub mod mem;
 pub mod models;
+pub mod paths;
 pub mod play_report;
 pub mod preferences;
 pub mod queue;
@@ -18,6 +22,9 @@ pub mod session;
 
 pub use audio::{PlaybackEngine, PlaybackSnapshot};
 pub use config::Settings;
+pub use download::{
+    DownloadCounts, DownloadEvent, DownloadManager, DownloadSettings, DownloadState, DownloadTask,
+};
 pub use models::{PlaylistItem, SceneItem, TrackItem};
 pub use play_report::PlayReporter;
 pub use queue::{PlayMode, Queue};

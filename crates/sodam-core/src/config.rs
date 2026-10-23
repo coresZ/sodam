@@ -1,6 +1,8 @@
 //! 应用配置（`~/.config/sodam/config.json`）。
 
+use crate::download::DownloadSettings;
 use serde::{Deserialize, Serialize};
+use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -46,6 +48,8 @@ pub struct Settings {
     pub shortcut_previous: String,
     /// 下一首。
     pub shortcut_next: String,
+    /// 下载设置（音质 / 目录 / 命名 / 并发…）；老配置缺这一段时用默认值。
+    pub download: DownloadSettings,
 }
 
 /// 播放控制快捷键的内置默认值。
@@ -248,19 +252,14 @@ impl Default for Settings {
             shortcut_toggle: String::new(),
             shortcut_previous: String::new(),
             shortcut_next: String::new(),
+            download: DownloadSettings::default(),
         }
     }
 }
 
 impl Settings {
     pub fn config_path() -> PathBuf {
-        if let Some(path) = std::env::var_os("SODAM_CONFIG_PATH").filter(|path| !path.is_empty()) {
-            return path.into();
-        }
-        dirs::config_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("sodam")
-            .join("config.json")
+        crate::paths::config_dir().join("config.json")
     }
 
     /// 读配置；文件不存在时返回默认值（不报错）。
@@ -447,6 +446,22 @@ impl Settings {
     /// 是否已经具备"能放 VIP 整曲"的条件（cookie + 签名服务）。
     pub fn is_ready_for_vip(&self) -> bool {
         !self.cookie.trim().is_empty() && !self.signer_url.trim().is_empty()
+    }
+
+    /// 影响网络请求的字段指纹：变了就必须重建会话（下载管理器据此决定是否更新设置）。
+    ///
+    /// 故意**不含**主题 / 语言 / 快捷键 / 下载偏好这些纯界面项，
+    /// 否则改一次设置就要重建一遍会话。
+    pub fn fingerprint(&self) -> u64 {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.cookie.hash(&mut hasher);
+        self.signer_url.hash(&mut hasher);
+        self.signer_token.hash(&mut hasher);
+        self.device_id.hash(&mut hasher);
+        self.iid.hash(&mut hasher);
+        self.fp.hash(&mut hasher);
+        self.quality.hash(&mut hasher);
+        hasher.finish()
     }
 
     /// 生效的播放/暂停快捷键（配置为空时用内置默认值）。
@@ -740,5 +755,56 @@ mod tests {
             reread.contains(expected.as_str()),
             "配置文件里应已是规范串：{reread}"
         );
+    }
+
+    /// 下载设置：老配置缺 `download` 块时用默认值，且能随配置一起往返。
+    #[test]
+    fn download_settings_round_trip_and_legacy_defaults() {
+        // 老配置文件里完全没有 download 字段
+        let parsed: Settings =
+            serde_json::from_str(r#"{"cookie":"x","quality":"lossless"}"#).expect("老配置应能解析");
+        assert_eq!(parsed.download, DownloadSettings::default());
+        assert_eq!(parsed.download.naming, crate::download::DEFAULT_NAMING);
+
+        let dir = std::env::temp_dir().join(format!("sodam-cfg-dl-{}", std::process::id()));
+        let path = dir.join("config.json");
+        let settings = Settings {
+            download: DownloadSettings {
+                quality: "highest".into(),
+                dir: "/tmp/sodam".into(),
+                naming: "{title}".into(),
+                write_cover: false,
+                write_lyrics: false,
+                concurrent: 1,
+                retry_count: 0,
+                overwrite: true,
+            },
+            ..Default::default()
+        };
+        settings.save_to(&path).expect("save");
+        assert_eq!(Settings::load_from(&path).download, settings.download);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 指纹只跟随网络相关字段：改主题 / 语言 / 下载偏好不该重建会话。
+    #[test]
+    fn fingerprint_tracks_network_fields_only() {
+        let base = Settings::default();
+        let fingerprint = base.fingerprint();
+
+        let mut themed = base.clone();
+        themed.theme = "light".into();
+        themed.language = "en".into();
+        themed.shortcut_next = "alt-j".into();
+        themed.download.dir = "/tmp/x".into();
+        assert_eq!(themed.fingerprint(), fingerprint);
+
+        let mut relogin = base.clone();
+        relogin.cookie = "sessionid_ss=x".into();
+        assert_ne!(relogin.fingerprint(), fingerprint);
+
+        let mut requality = base.clone();
+        requality.quality = "highest".into();
+        assert_ne!(requality.fingerprint(), fingerprint);
     }
 }

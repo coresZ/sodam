@@ -28,6 +28,8 @@ pub(crate) fn lyrics_view(root: &Root, window: &Window, cx: &mut Context<Root>) 
     };
 
     let liked = root.liked_ids.contains(&track.id);
+    // 本地文件按定义就在磁盘上 —— 不给「下载」按钮（点了也只会拿合成 id 去请求）。
+    let is_downloaded = root.is_local_track(&track) || root.downloaded.has(&track);
     let active = root.lyrics_active;
     let lines = root.lyrics.clone();
     let list = if root.lyrics.is_empty() {
@@ -72,12 +74,16 @@ pub(crate) fn lyrics_view(root: &Root, window: &Window, cx: &mut Context<Root>) 
         )
     };
 
+    // 本地曲目：封面优先用旁路图（磁盘上就有），其次清单里的网络 URL。
+    // 来源必须与 `ensure_playback_assets` 完全一致（同一个方法），
+    // 否则「已下载原图」会判定为假、界面一直显示重试加载。
+    let cover_source = root.playback_cover_source(&track);
     let cover_path = root
         .original_covers
-        .get(&track.cover)
+        .get(&cover_source)
         .cloned()
-        .or_else(|| root.cover_of(&track.cover));
-    let original_cover_ready = root.original_covers.contains_key(&track.cover);
+        .or_else(|| root.cover_of(&cover_source));
+    let original_cover_ready = root.original_covers.contains_key(&cover_source);
     // 切曲后的前 200ms 强制显示加载态（即便图在缓存里）。
     let cover_loading_gate = root
         .lyrics_cover_gate
@@ -155,6 +161,7 @@ pub(crate) fn lyrics_view(root: &Root, window: &Window, cx: &mut Context<Root>) 
                         .child(track.title.clone()),
                 )
                 .when(track.vip, |this| this.child(vip_badge()))
+                .child(download_slot(&track, is_downloaded, cx))
                 .child(like_button),
         )
         .child(
