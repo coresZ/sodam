@@ -408,6 +408,25 @@ pub const TOOLBAR_H: f32 = 48.0;
 /// 底部播放条高度。
 pub const PLAYER_H: f32 = 76.0;
 
+/// 叠加面板（队列抽屉 / 下载面板）在给定视口下的宽度。
+///
+/// 叠加层挂在 `width: auto` 的绝对定位包装层里，**不能用样式百分比**：
+/// `relative(0.4)` 会按元素自身宽度解析（320px 抽屉被压成 128px）。
+/// 所以宽度在 Rust 侧算成确定像素再传下去 —— 与播放页 `lyrics_width`
+/// （`30vw` clamp 300..500）同一套做法。
+///
+/// 规则：优先用设计宽度；窗口太窄时收缩，但给内容区保底
+/// （侧边栏 + [`OVERLAY_CONTENT_MIN_W`]）。
+pub fn overlay_panel_width(viewport_width: f32, design_width: f32) -> f32 {
+    let available = viewport_width - SIDEBAR_W - OVERLAY_CONTENT_MIN_W;
+    design_width.min(available).max(OVERLAY_PANEL_MIN_W)
+}
+
+/// 叠加面板的最小宽度：再窄行里的标题 / 时长就排不下了。
+pub const OVERLAY_PANEL_MIN_W: f32 = 240.0;
+/// 打开叠加面板时给内容区留的最小宽度。
+pub const OVERLAY_CONTENT_MIN_W: f32 = 320.0;
+
 /// 图标尺寸：导航与按钮统一 16，播放控制 20。
 pub const ICON_SM: f32 = 14.0;
 pub const ICON: f32 = 16.0;
@@ -482,4 +501,34 @@ impl Text {
 
 pub fn nav_row() -> Pixels {
     px(size::NAV_ROW)
+}
+
+#[cfg(test)]
+mod overlay_panel_tests {
+    use super::*;
+
+    /// 常规窗口（≥ 设计宽度 + 侧边栏 + 内容保底）给足设计宽度。
+    #[test]
+    fn wide_viewport_gets_design_width() {
+        // 1180 默认窗口：320 与 360 都应拿满。
+        assert_eq!(overlay_panel_width(1180.0, 320.0), 320.0);
+        assert_eq!(overlay_panel_width(1180.0, 360.0), 360.0);
+    }
+
+    /// 最小窗口（900）仍应给足设计宽度（900 - 216 - 320 = 364 ≥ 360）。
+    #[test]
+    fn minimum_window_still_fits_design_width() {
+        assert_eq!(overlay_panel_width(900.0, 320.0), 320.0);
+        assert_eq!(overlay_panel_width(900.0, 360.0), 360.0);
+    }
+
+    /// 被平铺 WM 压到比官方最小尺寸还窄时按可用区收缩，绝不低于可用宽度，
+    /// 也绝不低于面板最小宽度（行内标题 / 时长要排得下）。
+    #[test]
+    fn narrow_viewport_shrinks_but_stays_usable() {
+        // 700 - 216 - 320 = 164 < 240 → 取 240 保底。
+        assert_eq!(overlay_panel_width(700.0, 320.0), 240.0);
+        // 800 - 216 - 320 = 264，介于保底与设计宽度之间 → 取可用宽度。
+        assert_eq!(overlay_panel_width(800.0, 320.0), 264.0);
+    }
 }

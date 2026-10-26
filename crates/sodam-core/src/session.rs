@@ -1,6 +1,7 @@
 //! 会话层：把 [`Settings`] 变成可用的 libresoda 客户端。
 
 use crate::config::Settings;
+use crate::log_outlet::{log_event, LogLevel, LogTopic};
 use anyhow::Context;
 use libresoda::soda::signature::HttpSignature;
 use libresoda::{AppCredentials, Soda};
@@ -40,6 +41,16 @@ fn hash_url(url: &str) -> u64 {
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
     hash
+}
+
+/// `file://<路径>` → 本地路径；不是本地伪 URL 则 `None`。
+///
+/// 本地音乐页的旁路封面走这个约定：既复用了 `Root.covers`（URL → 本地路径）
+/// 这套现成的管道，又不必给封面池加一条全新的分支。
+fn local_file_url_path(url: &str) -> Option<std::path::PathBuf> {
+    url.strip_prefix("file://")
+        .filter(|rest| !rest.is_empty())
+        .map(std::path::PathBuf::from)
 }
 
 /// 账号信息（登录后展示用）。
@@ -139,8 +150,41 @@ pub struct CachedTrack {
     pub(crate) lease: crate::cache::CacheLease,
 }
 
+impl CachedTrack {
+    /// 播放**下载目录里的本地文件**：不进播放缓存，因此没有 LRU 语义，
+    /// 但仍然取一份租约，避免「清空缓存」与正在播放的文件互相撞车。
+    pub fn from_local(path: std::path::PathBuf, quality: impl Into<String>) -> Self {
+        let lease = crate::cache::CacheLease::acquire(&path);
+        Self {
+            path,
+            quality: quality.into(),
+            // 本地文件是完整文件，不存在试听片段。
+            preview: false,
+            lease,
+        }
+    }
+}
+
+/// 把 [`crate::models::TrackItem`] 翻成 libresoda 的 `Song`。
+///
+/// 播放缓存与下载两条链路共用同一份构造逻辑：`extra` 里的 `track_id`
+/// 是 libresoda 认的曲目 id（见 `libresoda::soda::download::song_track_id`）。
+pub(crate) fn song_for(track: &crate::models::TrackItem) -> libresoda::Song {
+    libresoda::Song {
+        id: track.id.clone(),
+        name: track.title.clone(),
+        artist: track.artist.clone(),
+        album: track.album.clone(),
+        duration: track.duration_seconds,
+        source: libresoda::model::SOURCE_SODA.to_string(),
+        link: format!("https://www.qishui.com/track/{}", track.id),
+        extra: std::collections::BTreeMap::from([("track_id".to_string(), track.id.clone())]),
+        ..Default::default()
+    }
+}
+
 /// 把 `DownloadInfo` 翻成界面用的音质标签（以**实际拉到的流**为准）。
-fn describe_quality(info: &libresoda::soda::types::DownloadInfo) -> String {
+pub(crate) fn describe_quality(info: &libresoda::soda::types::DownloadInfo) -> String {
     let bitrate = info.bitrate.max(0) / 1000;
     let lossless = libresoda::soda::quality::is_lossless(info)
         || info.format.eq_ignore_ascii_case("flac")
@@ -172,6 +216,16 @@ fn describe_quality(info: &libresoda::soda::types::DownloadInfo) -> String {
 /// 截断，不应拒绝；真正的风险只有实际更少（连接提前断开的静默 EOF）。
 fn is_truncated_download(declared: i64, written: u64) -> bool {
     declared > 0 && written < declared as u64
+}
+
+/// 刷新缓存文件的 mtime，作为 LRU 的「最近使用」信号。
+///
+/// 失败一律忽略：拿不到 mtime 只会让这首在淘汰时按更旧的顺序排，不影响正确性
+/// （Windows 上对以只读方式打开的句柄调 `set_modified` 可能失败）。
+fn touch_cache_file(path: &std::path::Path) {
+    if let Ok(file) = std::fs::File::open(path) {
+        let _ = file.set_modified(std::time::SystemTime::now());
+    }
 }
 
 /// 一次进程内共享的会话（持有 `Soda` 与当前设置）。
@@ -362,21 +416,13 @@ impl Session {
         let download_lock = crate::cache::download_lock(&path);
         let _writer = download_lock.lock().unwrap_or_else(|err| err.into_inner());
         if let Some(cached) = self.cached_track(&track.id) {
+            // LRU：命中都算一次「使用」（播放或预取），刷新 mtime 让淘汰时排到后面。
+            touch_cache_file(&cached.path);
             return Ok(cached);
         }
         let lease = crate::cache::CacheLease::acquire(&path);
 
-        let song = libresoda::Song {
-            id: track.id.clone(),
-            name: track.title.clone(),
-            artist: track.artist.clone(),
-            album: track.album.clone(),
-            duration: track.duration_seconds,
-            source: libresoda::model::SOURCE_SODA.to_string(),
-            link: format!("https://www.qishui.com/track/{}", track.id),
-            extra: std::collections::BTreeMap::from([("track_id".to_string(), track.id.clone())]),
-            ..Default::default()
-        };
+        let song = song_for(track);
         // 先写临时文件，校验完整后再改名 —— 下载中断永远留不下「看起来有效」的半截缓存。
         // 临时名带进程号+序号：预取与手动播放并发下同一首时互不踩踏。
         // 注意：这里写的还是**明文**，所以 `Range` 续传在结构上还不成立（见 issue 阶段二）。
@@ -435,6 +481,16 @@ impl Session {
                 err.to_string(),
             )
         })?;
+        // 落盘后按上限淘汰旧缓存（LRU）。这里是后台阻塞上下文，淘汰同步做也无妨；
+        // `path` 是最新的、本来就不会被选中，显式保护它是为了「上限小于单曲」的极端配置。
+        let evicted = crate::cache::trim_audio(self.settings.audio_cache_limit_mb);
+        let remaining = evicted.to_string();
+        log_event(
+            LogLevel::Debug,
+            LogTopic::Audio,
+            "cache_trimmed",
+            &[("remaining_bytes", remaining.as_str())],
+        );
         // 无损整曲下载 + 解密会在内存里同时持有加密数据、明文、mdat 多份缓冲，
         // 结束后把已释放的页归还系统，避免 macOS malloc 保留导致 RSS 长期虚高。
         crate::mem::release_malloc_pressure();
@@ -530,10 +586,12 @@ impl Session {
 
     /// 封面图本地缓存路径：有缓存就直接返回，没有就下载（失败返回 `None`，界面用占位图）。
     ///
-    /// 封面走 CDN，和音频一样只依赖 URL；缓存目录 `~/.cache/sodam/covers/`，
+    /// 封面走 CDN，和音频一样只依赖 URL；缓存目录见 [`crate::paths::cache_dir`]，
     /// 文件名用 URL 的哈希，避免奇怪字符和重复下载。
     /// 原始封面缓存：歌词页使用原图，列表仍使用缩略图。
-    pub fn original_cover_path(&self, url: &str) -> Option<std::path::PathBuf> {
+    ///
+    /// 网络封面专用；`file://` 伪 URL 的入口是 [`Self::original_cover_path`]。
+    fn remote_original_cover_path(&self, url: &str) -> Option<std::path::PathBuf> {
         let url = url.trim();
         if url.is_empty() {
             return None;
@@ -585,6 +643,10 @@ impl Session {
         if url.is_empty() {
             return None;
         }
+        // 本地文件（下载目录的旁路封面）没有 URL 可下：直接读盘 + 缩放缓存。
+        if let Some(local) = local_file_url_path(url) {
+            return self.cover_path_from_local(&local);
+        }
         let dir = crate::audio::cover_cache_dir();
         std::fs::create_dir_all(&dir).ok()?;
         // 文件名带目标边长：换尺寸/旧的全尺寸缓存不会混用
@@ -624,6 +686,53 @@ impl Session {
             }
         }
         Some(path)
+    }
+
+    /// 本地图片（`file://` 伪 URL）→ 缩略图缓存路径。
+    ///
+    /// 与网络封面共用同一套缓存（`covers/<hash>-160.img`），所以
+    /// **列表与播放页的渲染路径完全不用改** —— 它们只认 `Root.covers` 里的路径。
+    /// 缓存键是伪 URL 本身，因此同一个旁路文件只会缩放一次。
+    fn cover_path_from_local(&self, source: &std::path::Path) -> Option<std::path::PathBuf> {
+        let url = format!("file://{}", source.display());
+        let dir = crate::audio::cover_cache_dir();
+        std::fs::create_dir_all(&dir).ok()?;
+        let path = dir.join(format!("{:016x}-{COVER_MAX_EDGE}.img", hash_url(&url)));
+        if std::fs::metadata(&path)
+            .map(|meta| meta.len() > 0)
+            .unwrap_or(false)
+        {
+            return Some(path);
+        }
+        let bytes = std::fs::read(source).ok()?;
+        if bytes.is_empty() {
+            return None;
+        }
+        let shrunk = image::load_from_memory(&bytes)
+            .ok()
+            .map(|image| image.thumbnail(COVER_MAX_EDGE, COVER_MAX_EDGE));
+        match shrunk {
+            Some(image) => {
+                let mut encoded = std::io::Cursor::new(Vec::new());
+                image.write_to(&mut encoded, image::ImageFormat::Png).ok()?;
+                std::fs::write(&path, encoded.into_inner()).ok()?;
+            }
+            None => {
+                std::fs::write(&path, &bytes).ok()?;
+            }
+        }
+        Some(path)
+    }
+
+    /// 本地图片（`file://` 伪 URL）→ 原图路径（播放页大图用）。
+    ///
+    /// 旁路图本身通常就是 960px 级别，直接返回原文件即可，不再复制一份。
+    pub fn original_cover_path(&self, url: &str) -> Option<std::path::PathBuf> {
+        let url = url.trim();
+        if let Some(local) = local_file_url_path(url) {
+            return local.is_file().then_some(local);
+        }
+        self.remote_original_cover_path(url)
     }
 }
 

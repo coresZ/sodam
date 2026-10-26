@@ -2,6 +2,8 @@
 
 #[path = "app_actions.rs"]
 mod actions;
+#[path = "app_download.rs"]
+mod download_actions;
 #[path = "app_search.rs"]
 mod search_actions;
 
@@ -24,6 +26,8 @@ use sodam_core::{
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+
+use sodam_core::download::{DownloadCounts, DownloadManager, DownloadTask};
 
 /// 远程读取类失败的统一说法：读不到歌单、收藏、搜索、推荐都是这一句。
 pub(crate) const REMOTE_TEXT: &str = "出现了一点问题，检查网络后重试。";
@@ -113,6 +117,8 @@ pub enum Nav {
     Album,
     Settings,
     Lyrics,
+    /// 本地音乐：本应用下载到本地的曲目（跨重启持久）。
+    Local,
 }
 
 impl Root {
@@ -128,6 +134,7 @@ impl Root {
             Nav::Album => self.tr("专辑"),
             Nav::Settings => self.tr("设置"),
             Nav::Lyrics => self.tr("正在播放"),
+            Nav::Local => self.tr("本地音乐"),
         };
         if nav != Nav::Scenes {
             return label.to_string();
@@ -185,6 +192,8 @@ pub enum QueueOrigin {
     Artist(String),
     Album(String),
     Search,
+    /// 本地音乐页（磁盘上的文件，不走网络取流）。
+    Local,
 }
 
 impl QueueOrigin {
@@ -204,6 +213,278 @@ impl QueueOrigin {
 pub struct TrackMenu {
     pub track: TrackItem,
     pub position: gpui::Point<gpui::Pixels>,
+}
+
+/// 本地音乐页的横向入口。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LocalTab {
+    /// 本地音乐：**以磁盘为准** —— 下载目录里真实存在的每一个音频，
+    /// 包括用户自己放进来的（那些没有元数据，只显示文件名）。
+    #[default]
+    Songs,
+    /// 下载管理：**以记录为准** —— 本应用的下载任务与下载记录。
+    Downloads,
+    /// 扫描本地音乐。本次只放占位入口，扫描能力见 `design-plan.md` 的 B 阶段。
+    Scan,
+}
+
+/// 本地音乐列表的一行：磁盘上真实存在的一个音频文件。
+///
+/// 与「下载记录」（`download_library::LibraryEntry`）的区别是刻意的：
+/// 这里**以磁盘为准**，记录**以清单为准**。所以用户手动丢进下载目录的文件会出现在
+/// 「本地音乐」里、却不在「已下载」里 —— 这两个概念不该混成一份数据。
+#[derive(Clone, Default)]
+pub struct LocalFile {
+    /// 相对下载目录、不含扩展名。
+    pub relative: PathBuf,
+    /// 实际落盘扩展名（`m4a` / `flac` …）；拼绝对路径要用。
+    pub extension: String,
+    pub bytes: u64,
+    /// 清单里有对应记录时带上元数据（歌名 / 歌手 / 音质…）；没有则为 `None`。
+    pub entry: Option<sodam_core::download_library::LibraryEntry>,
+    /// 容器头探测出的时长（秒）；清单里的权威值优先。
+    pub probed_duration: Option<f64>,
+    /// `<下载目录>/image/<文件名>.<png|jpg|jpeg|webp>`（旁路封面），扫描时探得。
+    pub cover_path: Option<PathBuf>,
+    /// `<下载目录>/lrc/<文件名>.lrc`（旁路歌词），扫描时探得。
+    pub lyrics_path: Option<PathBuf>,
+}
+
+impl LocalFile {
+    /// 磁盘上的真实路径：`<下载目录>/<relative>.<extension>`。
+    ///
+    /// `relative` 不含扩展名（与清单主键、命名模板同源），这里**字面拼接**扩展名。
+    /// 不能用 `with_extension` —— 它会把曲名里本来就有的点号当成扩展名截断
+    /// （`A - B 1.5` → `A - B 1.m4a`，实测踩过，见下面的测试）。
+    pub fn absolute_path(&self, settings: &sodam_core::download::DownloadSettings) -> PathBuf {
+        let parent = self
+            .relative
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new(""));
+        let mut name = self
+            .relative
+            .file_name()
+            .map(|name| name.to_os_string())
+            .unwrap_or_default();
+        name.push(".");
+        name.push(&self.extension);
+        settings.resolve_dir().join(parent).join(name)
+    }
+
+    /// 展示用时长（秒）：清单权威值 → 探测值 → 无。
+    pub fn duration_seconds(&self) -> Option<i64> {
+        self.entry
+            .as_ref()
+            .and_then(|entry| entry.duration_seconds)
+            .filter(|seconds| *seconds > 0)
+            .or_else(|| {
+                self.probed_duration
+                    .filter(|seconds| *seconds > 0.0)
+                    .map(|seconds| seconds.round() as i64)
+            })
+    }
+
+    /// 交给引擎的 `TrackItem`。
+    ///
+    /// 有清单记录就用它的元数据；没有（用户手动放进下载目录的文件）就合成一个：
+    /// `id` 用 `local:<relative>`（**必须非空** —— `toggle_play` 等处以
+    /// `snapshot.track_id.is_empty()` 判断"引擎还没装载"），标题退化成文件名。
+    pub fn to_track(&self) -> TrackItem {
+        if let Some(entry) = self.entry.as_ref() {
+            if let Some(track) = entry.to_track() {
+                return track;
+            }
+        }
+        let relative = self.relative.to_string_lossy().replace('\\', "/");
+        TrackItem {
+            id: format!("local:{relative}"),
+            title: self
+                .entry
+                .as_ref()
+                .map(|entry| entry.display_title())
+                .unwrap_or_else(|| {
+                    self.relative
+                        .file_name()
+                        .map(|name| name.to_string_lossy().to_string())
+                        .unwrap_or_else(|| relative.clone())
+                }),
+            artist: self
+                .entry
+                .as_ref()
+                .map(|entry| entry.display_artist())
+                .unwrap_or_default(),
+            duration_seconds: self.duration_seconds().unwrap_or(0),
+            ..Default::default()
+        }
+    }
+}
+
+/// 「已下载」判定快照。
+///
+/// 把「已存在的音频相对路径集合」和「算这些路径时用的命名模板」**成对**快照下来：
+/// 路径是拿模板算出来的，模板一改旧路径就对不上，两者必须同源同版本。
+///
+/// 判定语义严格等于「点下载会不会说『已存在』」——用的是 `download::scan_downloaded`
+/// 与 `download::render_relative_path`，与下载侧跳过逻辑同一套代码。
+///
+/// **不代表播放会走本地文件或能离线播放**：播放用的是独立的播放缓存
+/// （`session.rs` 的 `cached_track`），完全不读下载目录。
+#[derive(Clone, Default)]
+pub struct DownloadedIndex {
+    paths: Arc<HashSet<PathBuf>>,
+    naming: Arc<str>,
+}
+
+#[cfg(test)]
+mod local_file_tests {
+    use super::LocalFile;
+    use sodam_core::download::DownloadSettings;
+    use std::path::PathBuf;
+
+    /// 没有元数据的文件（用户手动放进下载目录的）也要能交给引擎：
+    /// 合成 id 必须非空 —— `toggle_play` 等处以 `track_id.is_empty()`
+    /// 判断「引擎还没装载」，空 id 会让播放键永远走「装载当前曲目」分支。
+    #[test]
+    fn synthetic_track_has_a_non_empty_id_and_falls_back_to_file_name() {
+        let file = LocalFile {
+            relative: PathBuf::from("某歌手 - 某歌"),
+            extension: "m4a".to_string(),
+            bytes: 1234,
+            ..Default::default()
+        };
+        let track = file.to_track();
+        assert!(!track.id.is_empty(), "合成 id 不能为空：{:?}", track.id);
+        assert_eq!(track.id, "local:某歌手 - 某歌");
+        assert_eq!(track.title, "某歌手 - 某歌", "标题退化成文件名");
+        assert_eq!(track.duration_seconds, 0, "未知时长按 0");
+    }
+
+    /// 有清单记录时用记录的元数据（不是文件名）。
+    #[test]
+    fn entry_metadata_wins_over_the_file_name() {
+        let entry = sodam_core::download_library::LibraryEntry {
+            relative: PathBuf::from("A - B"),
+            extension: "m4a".to_string(),
+            source: sodam_core::download_library::EntrySource::Downloaded,
+            bytes: 10,
+            added_at: 0,
+            quality: Some("无损 871k".to_string()),
+            downloaded_at: Some(0),
+            mtime: None,
+            track_id: Some("123".to_string()),
+            title: Some("真标题".to_string()),
+            artist: Some("真歌手".to_string()),
+            album: None,
+            artist_id: None,
+            album_id: None,
+            cover: None,
+            duration_seconds: Some(215),
+            vip: Some(false),
+        };
+        let file = LocalFile {
+            relative: PathBuf::from("A - B"),
+            extension: "m4a".to_string(),
+            bytes: 10,
+            entry: Some(entry),
+            ..Default::default()
+        };
+        let track = file.to_track();
+        assert_eq!(track.id, "123");
+        assert_eq!(track.title, "真标题");
+        assert_eq!(track.artist, "真歌手");
+        assert_eq!(track.duration_seconds, 215);
+    }
+
+    /// 相对路径（不含扩展名）+ 扫盘记下的扩展名 → 磁盘上的真实路径。
+    ///
+    /// 关键：不能用 `with_extension` 去「猜」扩展名 —— 歌名里的点号
+    /// （`A - B 1.5`）会被当成扩展名截断。这里断言含点号的曲名能还原正确。
+    #[test]
+    fn absolute_path_appends_the_scanned_extension() {
+        let settings = DownloadSettings {
+            dir: "/tmp/sodam-dl".to_string(),
+            ..Default::default()
+        };
+        let file = LocalFile {
+            relative: PathBuf::from("A - B 1.5"),
+            extension: "m4a".to_string(),
+            bytes: 10,
+            ..Default::default()
+        };
+        assert_eq!(
+            file.absolute_path(&settings),
+            PathBuf::from("/tmp/sodam-dl/A - B 1.5.m4a")
+        );
+    }
+
+    /// 命名模板带 `/` 分层时，父目录要保留（不能把整条相对路径拍平）。
+    #[test]
+    fn absolute_path_keeps_template_subdirectories() {
+        let settings = DownloadSettings {
+            dir: "/tmp/sodam-dl".to_string(),
+            ..Default::default()
+        };
+        let file = LocalFile {
+            relative: PathBuf::from("某歌手/某专辑/歌名"),
+            extension: "flac".to_string(),
+            bytes: 10,
+            ..Default::default()
+        };
+        assert_eq!(
+            file.absolute_path(&settings),
+            PathBuf::from("/tmp/sodam-dl/某歌手/某专辑/歌名.flac")
+        );
+    }
+
+    /// 回归：本地曲目的封面来源必须是 `file://` 伪 URL，而不是空的 `track.cover`。
+    ///
+    /// 曾经的问题：`ensure_playback_assets` 拿 `track.cover` 准备封面，
+    /// 而播放页渲染用 `file://` 取图 —— 两者对不上，「已下载原图」永远为假，
+    /// 界面一直显示「重试加载」（用户报的 bug）。
+    #[test]
+    fn local_cover_source_prefers_the_sidecar() {
+        let file = LocalFile {
+            relative: PathBuf::from("Yang"),
+            extension: "m4a".to_string(),
+            bytes: 10,
+            cover_path: Some(PathBuf::from("/tmp/sodam-dl/image/Yang.png")),
+            ..Default::default()
+        };
+        // 无元数据的文件：`to_track()` 合成 id，`cover` 为空。
+        let track = file.to_track();
+        assert!(track.cover.is_empty(), "合成曲目没有网络封面");
+
+        // 复现 `Root::playback_cover_source` 的判定（它需要完整 Root，这里只测规则）。
+        let source = file
+            .cover_path
+            .as_ref()
+            .map(|path| format!("file://{}", path.display()))
+            .unwrap_or_else(|| track.cover.clone());
+        assert_eq!(source, "file:///tmp/sodam-dl/image/Yang.png");
+        assert!(!source.is_empty(), "来源不能为空 —— 空的会让封面池直接跳过");
+    }
+}
+
+impl DownloadedIndex {
+    /// 由一份已经扫好的「已存在的音频相对路径集合」构造。
+    ///
+    /// 扫盘只做一次：`refresh_local` 把同一份集合同时喂给这个标记和本地音乐库
+    /// （大目录 / 网络盘上少扫一整遍）。
+    pub(crate) fn from_paths(paths: HashSet<PathBuf>, naming: &str) -> Self {
+        Self {
+            paths: Arc::new(paths),
+            naming: Arc::from(naming),
+        }
+    }
+
+    /// 这首曲目在下载目录里是否已经有音频文件。
+    pub fn has(&self, track: &TrackItem) -> bool {
+        self.paths
+            .contains(&sodam_core::download::render_relative_path(
+                &self.naming,
+                track,
+            ))
+    }
 }
 
 /// 根视图状态。
@@ -321,6 +602,30 @@ pub struct Root {
     liked_loading: bool,
     /// 收藏 ids 拉取失败（网络等）：置位后等网络就绪信号自动重试。
     pub liked_ids_failed: bool,
+    /// 「已下载」标记快照：后台扫一次下载目录，渲染只读这份快照。
+    pub downloaded: DownloadedIndex,
+    /// 本地音乐库快照（清单 ∩ 扫盘校验通过）；跨重启存在。
+    pub library: Arc<Vec<sodam_core::download_library::LibraryEntry>>,
+    /// 「本地音乐」列表：磁盘真相（比 `library` 多出用户手动放进来的文件）。
+    pub local_files: Arc<Vec<LocalFile>>,
+    /// 元数据匹配进行中：`(已完成, 总数)`；`None` = 没在跑。
+    ///
+    /// 批量匹配是串行 + 限速的后台任务，界面据此显示进度。
+    pub matching: Option<(usize, usize)>,
+    /// 本地音乐行的右键菜单：`(相对路径, 弹窗位置)`。
+    pub local_menu: Option<(PathBuf, gpui::Point<gpui::Pixels>)>,
+    /// 「手动选择匹配」浮层：`(目标文件相对路径, 候选列表)`。
+    ///
+    /// 自动匹配失败（或用户想自己挑）时打开；候选已按分数降序、最多 5 条。
+    pub match_picker: Option<(PathBuf, Vec<sodam_core::match_metadata::MatchOutcome>)>,
+    /// 本地音乐页当前横向入口。
+    pub local_tab: LocalTab,
+    /// 清单里有、磁盘上已不在的条目（页面的「待重下」分区）。
+    pub library_missing: Arc<Vec<sodam_core::download_library::LibraryEntry>>,
+    /// 已有本地库扫描在跑：只记一个「待重扫」，避免连续触发堆出一串扫描。
+    pub(crate) local_scanning: bool,
+    /// 扫描期间又被请求刷新：结束后补扫一次。
+    pub(crate) local_rescan: bool,
     pub loading_library: bool,
     pub loading_liked: bool,
     pub liked_loaded: bool,
@@ -437,6 +742,51 @@ pub struct Root {
     pub engine: PlaybackEngine,
     /// 播放进度 / 时长上报（喂引擎快照，内部异步发请求）。
     pub play_reporter: PlayReporter,
+    /// 下载管理器（队列 / 并发 / 状态机全在 sodam-core）。
+    pub downloads: DownloadManager,
+    /// 下载面板是否展开（与队列抽屉互斥）。
+    pub download_open: bool,
+    /// 下载面板当前分区。
+    pub download_tab: DownloadTab,
+    /// 任务快照缓存：`(revision, tasks)`，渲染只读它，避免每帧深拷贝整个队列。
+    pub download_cache: (u64, Arc<Vec<DownloadTask>>),
+    /// 任务统计快照（侧栏徽章 / 分区标签）。
+    pub download_counts: DownloadCounts,
+    /// 上次推给下载管理器的设置指纹（避免每帧深拷贝 Settings）。
+    pub(crate) download_settings_fingerprint: u64,
+}
+
+/// 下载面板的分区。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DownloadTab {
+    #[default]
+    Active,
+    Completed,
+    Failed,
+}
+
+impl DownloadTab {
+    pub const ALL: [DownloadTab; 3] = [
+        DownloadTab::Active,
+        DownloadTab::Failed,
+        DownloadTab::Completed,
+    ];
+
+    pub fn label(self, language: Language) -> &'static str {
+        match self {
+            DownloadTab::Active => language.text("下载中"),
+            DownloadTab::Failed => language.text("下载失败"),
+            DownloadTab::Completed => language.text("已下载"),
+        }
+    }
+
+    pub fn matches(self, state: &sodam_core::download::DownloadState) -> bool {
+        match self {
+            DownloadTab::Active => state.is_active(),
+            DownloadTab::Completed => state.is_finished(),
+            DownloadTab::Failed => state.is_failed(),
+        }
+    }
 }
 
 impl Root {
@@ -480,6 +830,8 @@ impl Root {
 
         let logged_in = !settings.cookie.trim().is_empty();
         let play_reporter = PlayReporter::new(settings.clone());
+        let downloads = DownloadManager::new(settings.clone());
+        downloads.set_download_settings(settings.download.clone());
         let mut root = Self {
             titlebar_anchor: std::rc::Rc::new(std::cell::Cell::new(None)),
             // 未登录只能待在设置页（登录入口在设置 → 账户）
@@ -586,6 +938,16 @@ impl Root {
             liked_ids: Arc::new(HashSet::new()),
             liked_loading: false,
             liked_ids_failed: false,
+            downloaded: DownloadedIndex::default(),
+            library: Arc::new(Vec::new()),
+            local_files: Arc::new(Vec::new()),
+            matching: None,
+            local_menu: None,
+            match_picker: None,
+            local_tab: LocalTab::default(),
+            library_missing: Arc::new(Vec::new()),
+            local_scanning: false,
+            local_rescan: false,
             loading_library: false,
             loading_liked: false,
             liked_loaded: false,
@@ -635,6 +997,12 @@ impl Root {
             account: None,
             engine,
             play_reporter,
+            downloads,
+            download_open: false,
+            download_tab: DownloadTab::default(),
+            download_cache: (u64::MAX, Arc::new(Vec::new())),
+            download_counts: DownloadCounts::default(),
+            download_settings_fingerprint: 0,
         };
         cx.on_app_quit(|root, _cx| {
             sodam_core::flush_global();
@@ -649,6 +1017,8 @@ impl Root {
         } else {
             root.set_status_text(root.tr("请先在「设置 → 账户」扫码登录"));
         }
+        // 本地目录扫描与登录无关（纯本地文件系统），启动就快照一次。
+        root.refresh_local(cx);
         // 开发/验证便利：`SODAM_QUERY="周杰伦" cargo run -p sodam` 启动即搜索一次
         if let Ok(query) = std::env::var("SODAM_QUERY") {
             if !query.trim().is_empty() {
@@ -668,6 +1038,7 @@ impl Root {
                 "artist" => Nav::Artist,
                 "album" => Nav::Album,
                 "settings" => Nav::Settings,
+                "local" => Nav::Local,
                 _ => root.nav,
             };
             root.on_nav_changed(cx);
@@ -716,7 +1087,7 @@ impl Root {
         Self::start_heartbeat(cx);
 
         // 开发验证用：`SODAM_AUTOPLAY=1` 进收藏页并自动播放第一首；
-        // `SODAM_POPUP=quality|queue|volume` 启动即打开对应弹层（便于截图核对）。
+        // `SODAM_POPUP=queue|downloads` 启动即打开对应叠加面板（便于截图核对）。
         if std::env::var("SODAM_AUTOLOGIN").is_ok() && !root.settings.cookie.trim().is_empty() {
             root.login_modal_open = true;
             root.start_login(cx);
@@ -813,11 +1184,13 @@ impl Root {
             })
             .detach();
         }
-        if std::env::var("SODAM_POPUP")
-            .map(|value| value.trim() == "queue")
-            .unwrap_or(false)
-        {
-            root.queue_open = true;
+        // 开发验证用：`SODAM_POPUP=queue|downloads` 启动即打开对应叠加面板（便于截图核对）。
+        if let Ok(popup) = std::env::var("SODAM_POPUP") {
+            match popup.trim() {
+                "queue" => root.queue_open = true,
+                "downloads" | "download" => root.download_open = true,
+                _ => {}
+            }
         }
         root
     }
@@ -1365,6 +1738,9 @@ impl Render for Root {
         theme::set_ambient_rgb(ambient_color);
         // 上一帧布局未就绪时记下的歌词对齐，在这里补做一次。
         self.flush_pending_lyrics_scroll();
+        // 叠加面板的宽度在 Rust 侧算（不能交给样式系统的百分比 —— 见
+        // `theme::overlay_panel_width`）。
+        let viewport_width = f32::from(window.viewport_size().width);
         if self.nav == Nav::Lyrics {
             let position = self.engine.snapshot().position_seconds;
             let active = self
@@ -1415,6 +1791,7 @@ impl Render for Root {
             .text_color(ui::theme::text())
             .child(
                 div()
+                    .relative()
                     .flex()
                     .flex_row()
                     .flex_1()
@@ -1430,8 +1807,41 @@ impl Render for Root {
                             .when(own_titlebar, |this| this.pt(px(ui::titlebar::STRIP_HEIGHT)))
                             .child(views::render(self, window, cx)),
                     )
+                    // 右侧面板**叠加**在内容之上，而不是挤压内容区。
+                    //
+                    // 之前是 flex 兄弟节点（`w(320) flex_none`）：打开抽屉会把
+                    // 列表压窄 —— 表格列宽是按容器算的，一压就错位（`mod.rs`
+                    // 的 `columns_for` 依赖可用宽度）。播放页不受影响：它是
+                    // 封面 + 歌词的自适应布局，本来就有缩放兜底。
+                    //
+                    // 宽度在 Rust 侧按视口算成确定像素（`theme::overlay_panel_width`）：
+                    // 叠加层是 `width: auto` 的绝对定位盒子，交给样式系统的
+                    // `relative(..)` 会按元素自身宽度解析（320 × 0.4 = 128px）。
                     .when(self.queue_open && self.nav != Nav::Lyrics, |this| {
-                        this.child(ui::player_bar::queue_drawer(self, cx, own_titlebar))
+                        this.child(div().absolute().top(px(0.0)).right(px(0.0)).h_full().child(
+                            ui::player_bar::queue_drawer(
+                                self,
+                                ui::theme::overlay_panel_width(
+                                    viewport_width,
+                                    ui::player_bar::DRAWER_W,
+                                ),
+                                cx,
+                                own_titlebar,
+                            ),
+                        ))
+                    })
+                    .when(self.download_open, |this| {
+                        this.child(div().absolute().top(px(0.0)).right(px(0.0)).h_full().child(
+                            views::downloads::panel(
+                                self,
+                                ui::theme::overlay_panel_width(
+                                    viewport_width,
+                                    views::downloads::PANEL_W,
+                                ),
+                                own_titlebar,
+                                cx,
+                            ),
+                        ))
                     }),
             )
             .child(ui::player_bar::render(self, cx))
@@ -1443,6 +1853,12 @@ impl Render for Root {
             .when(self.track_menu.is_some(), |this| {
                 this.child(crate::views::track_menu(self, cx))
             })
+            .when(self.local_menu.is_some(), |this| {
+                this.child(crate::views::local_music::local_menu(self, cx))
+            })
+            .when(self.match_picker.is_some(), |this| {
+                this.child(crate::views::local_music::match_picker(self, cx))
+            })
             .when(
                 self.login_modal_open && self.settings.cookie.trim().is_empty(),
                 |this| this.child(crate::views::login_modal(self, cx)),
@@ -1451,7 +1867,7 @@ impl Render for Root {
                 this.child(message)
             })
             .when(
-                self.queue_menu.is_some() || self.track_menu.is_some(),
+                self.queue_menu.is_some() || self.track_menu.is_some() || self.local_menu.is_some(),
                 |this| {
                     // 透明遮罩：点任何地方都关掉右键菜单；
                     // 菜单本身层级更高（priority 2 > 1），点菜单不会走到这里。
@@ -1466,9 +1882,13 @@ impl Render for Root {
                                 .on_mouse_down(
                                     gpui::MouseButton::Left,
                                     cx.listener(|root, _event, _window, cx| {
-                                        if root.queue_menu.is_some() || root.track_menu.is_some() {
+                                        if root.queue_menu.is_some()
+                                            || root.track_menu.is_some()
+                                            || root.local_menu.is_some()
+                                        {
                                             root.queue_menu = None;
                                             root.track_menu = None;
+                                            root.local_menu = None;
                                             cx.notify();
                                         }
                                     }),

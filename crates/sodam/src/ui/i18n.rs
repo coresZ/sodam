@@ -302,6 +302,12 @@ impl Language {
                 "Total {} ({} songs {}, {} covers {})"
             }
             "清除歌曲缓存" => "Clear Song Cache",
+            "播放缓存上限" => "Playback cache limit",
+            "达到上限的 85% 起按最近最少使用淘汰旧缓存；0 = 不限" => {
+                "Evict least-recently-used above 85% of the limit; 0 = unlimited"
+            }
+            "不限" => "Unlimited",
+            "缓存设置已保存" => "Cache settings saved",
             "其他" => "Other",
             "维护者" => "Maintainer",
             "贡献者" => "Contributors",
@@ -516,6 +522,130 @@ impl Language {
                 "Following system; choose a language to pin it"
             }
             "{}；音质已按权益自动设为 {}" => "{}; quality set to {}",
+            // 下载
+            "下载" => "Download",
+            "下载全部" => "Download All",
+            "已下载" => "Downloaded",
+            "已下载 {} 首" => "{} downloaded",
+            "重新下载" => "Download again",
+            // 本地音乐页
+            "本地音乐" => "Local Music",
+            "下载中" => "Downloading",
+            "待重下" => "Needs re-download",
+            "未知音质" => "Unknown quality",
+            "还没有下载到本地的歌曲" => "No downloaded songs yet",
+            "没有正在进行的下载" => "Nothing downloading",
+            "没有需要重下的内容" => "Nothing to re-download",
+            "{} 首 · {} 首待重下" => "{} tracks · {} to re-download",
+            // 本地音乐页的横向入口与下载管理
+            "下载管理" => "Downloads",
+            "扫描本地音乐" => "Scan Local Music",
+            "扫描本地音乐即将支持" => "Scanning local music is coming soon",
+            "之后可以在这里添加本地文件夹，把你自己的音乐一并纳入「本地音乐」。" => {
+                "You'll be able to add local folders here and bring your own music into Local Music."
+            }
+            "匹配信息" => "Match Info",
+            "手动选择匹配" => "Pick Match Manually",
+            "选择匹配" => "Choose a Match",
+            "有 {} 个相似结果，请手动选择" => "{} similar results found — pick one manually",
+            "补全信息（{} 首）" => "Fill Info ({} tracks)",
+            "正在匹配：{}" => "Matching: {}",
+            "正在搜索：{}" => "Searching: {}",
+            "正在匹配：{}/{}" => "Matching: {}/{}",
+            "匹配中：{}" => "Matching: {}",
+            "匹配完成：{} 首（共 {} 首）" => "Matched {} of {} tracks",
+            "未找到匹配：{}" => "No match found for {}",
+            "匹配失败：{err}" => "Match failed: {err}",
+            "已匹配：{}（{} 分）" => "Matched: {} (score {})",
+            "没有需要匹配的文件" => "Nothing to match",
+            "开始匹配 {} 个文件…" => "Matching {} files…",
+            "写入清单失败：{err}" => "Failed to write the manifest: {err}",
+            "下载失败" => "Download failed",
+            "清理记录" => "Clear Records",
+            "已清理 {} 条记录" => "Cleared {} records",
+            "文件已不在" => "File missing",
+            "下载目录里还没有音频文件" => "No audio files in the download folder yet",
+            "没有失败的下载" => "No failed downloads",
+            "还没有下载记录" => "No download records yet",
+            "下载管理" => "Downloads",
+            "下载设置" => "Download Settings",
+            "下载音质" => "Download Quality",
+            "下载位置" => "Download Folder",
+            "文件命名" => "File Naming",
+            "写入封面" => "Save Cover",
+            "写入歌词" => "Save Lyrics",
+            "同时下载数" => "Concurrent Downloads",
+            "已存在文件" => "Existing Files",
+            "跳过" => "Skip",
+            "覆盖" => "Overwrite",
+            "失败重试" => "Retry Attempts",
+            "次" => "times",
+            "进行中" => "Active",
+            "已完成" => "Completed",
+            "已暂停" => "Paused",
+            "等待中" => "Queued",
+            "全部暂停" => "Pause All",
+            "全部继续" => "Resume All",
+            "清空已完成" => "Clear Finished",
+            "打开文件夹" => "Open Folder",
+            "打开文件" => "Open File",
+            "重试" => "Retry",
+            "删除记录" => "Remove",
+            "取消下载" => "Cancel",
+            "继续下载" => "Resume",
+            "暂停下载" => "Pause",
+            "已保存到 {}" => "Saved to {}",
+            "下载失败：{}" => "Download failed: {}",
+            "「{}」下载完成" => "Downloaded {}",
+            "「{}」下载失败：{err}" => "Download failed for {}: {err}",
+            "已加入下载队列：{}" => "Added to downloads: {}",
+            "已加入下载队列：{} 首（跳过 {} 首已在队列）" => {
+                "Added {} tracks to downloads ({} already queued)"
+            }
+            "这些歌曲已在下载队列里" => "These tracks are already in the download queue",
+            "没有可下载的曲目" => "Nothing to download",
+            "已暂停全部下载" => "All downloads paused",
+            "已继续全部下载" => "All downloads resumed",
+            "已打开文件夹：{}" => "Opened folder: {}",
+            "打开文件夹失败：{err}" => "Failed to open folder: {err}",
+            "下载任务已清空" => "Finished downloads cleared",
+            "下载设置已保存" => "Download settings saved",
+            "下载目录：{}" => "Download folder: {}",
+            "下载完成后打开所在文件夹" => "Open the folder when finished",
+            "下载音质与播放音质分开：批量下载不会抢最高档" => {
+                "Download quality is separate from playback quality"
+            }
+            "命名模板支持 {artist} / {title} / {album}；用 / 分层" => {
+                "Template supports {artist} / {title} / {album}; use / for folders"
+            }
+            "缓存目录（播放用）与下载目录分开，清缓存不会删掉下载" => {
+                "Playback cache and download folder are separate; clearing the cache keeps downloads"
+            }
+            "下载管理 · {} 项" => "Downloads · {}",
+            "下载队列为空" => "No downloads yet",
+            "已存在 · {}" => "Already exists · {}",
+            "下载设置已保存" => "Download settings saved",
+            "已打开文件夹：{}" => "Opened folder: {}",
+            "已暂停全部下载" => "All downloads paused",
+            "已继续全部下载" => "All downloads resumed",
+            "已取消" => "Cancelled",
+            "跟随播放音质" => "Match playback quality",
+            "空 = 跟随播放音质；下载任务创建后不受后续改动影响" => {
+                "Empty = follow playback quality; queued tasks keep their snapshot"
+            }
+            "编辑路径" => "Edit Path",
+            "在同目录写一份封面图片" => "Write a cover image next to the audio file",
+            "在同目录写 .lrc（标准行级时间轴）" => "Write a .lrc file (standard line timeline)",
+            "并发越高越吃带宽与签名服务；建议 2" => {
+                "Higher concurrency uses more bandwidth and signer calls; 2 is recommended"
+            }
+            "网络类错误自动重试；试听 / 无权限不重试" => {
+                "Network errors retry automatically; preview / no-permission does not"
+            }
+            "按曲目 id 与命名模板判断目标文件是否已存在" => {
+                "Target file is matched by track id and the naming template"
+            }
+            "保存失败：{err}" => "Failed to save: {err}",
             _ => return None,
         })
     }

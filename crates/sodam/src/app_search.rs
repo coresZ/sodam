@@ -302,12 +302,24 @@ impl Root {
     }
 
     /// 从任意曲目打开专辑页；列表/播放条/播放页共用。
+    ///
+    /// **已经在这个专辑页时不再重复打开** —— 专辑页里的每一行也走这个入口，
+    /// 不拦的话点歌名会把自己再压一层栈（返回栈被同一个专辑塞满，看起来像死循环）。
     pub fn open_track_album(
         &mut self,
         track: sodam_core::models::TrackItem,
         cx: &mut Context<Self>,
     ) {
         if track.album_id.is_empty() {
+            return;
+        }
+        let already_open = self.nav == Nav::Album
+            && self
+                .open_album
+                .as_ref()
+                .map(|detail| detail.album.id == track.album_id)
+                .unwrap_or(false);
+        if already_open {
             return;
         }
         self.open_album_page(
@@ -322,12 +334,23 @@ impl Root {
     }
 
     /// 从任意曲目打开音乐人页；列表/播放条/播放页共用。
+    ///
+    /// 同 [`Self::open_track_album`]：已在当前歌手页时不再重复压栈。
     pub fn open_track_artist(
         &mut self,
         track: sodam_core::models::TrackItem,
         cx: &mut Context<Self>,
     ) {
         if track.artist_id.is_empty() {
+            return;
+        }
+        let already_open = self.nav == Nav::Artist
+            && self
+                .open_artist
+                .as_ref()
+                .map(|detail| detail.artist.id == track.artist_id)
+                .unwrap_or(false);
+        if already_open {
             return;
         }
         self.open_artist_page(
