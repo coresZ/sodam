@@ -228,6 +228,18 @@ pub enum LocalTab {
     Scan,
 }
 
+/// 当前接收编辑键的输入框。
+///
+/// `app_text` 的所有动作都通过 `Root::active_field_mut` 分发到这里选中的那一份，
+/// 不再硬编码 `search_field` —— 否则在「本地音乐」的过滤框里打字会写进搜索页。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActiveInput {
+    /// 顶部搜索页的搜索框。
+    Search,
+    /// 「本地音乐 → 本地音乐」页的过滤框。
+    LocalFilter,
+}
+
 /// 本地音乐列表的一行：磁盘上真实存在的一个音频文件。
 ///
 /// 与「下载记录」（`download_library::LibraryEntry`）的区别是刻意的：
@@ -542,6 +554,17 @@ pub struct Root {
     /// 防止快速换歌时旧歌词请求回写。
     lyrics_request_seq: u64,
     pub search_field: TextField,
+    /// 「本地音乐」页的过滤框。
+    ///
+    /// 和 `search_field` 共用 [`app_text`] 的编辑动作（通过 [`ActiveInput`] 分发），
+    /// 但两者状态独立：在本地音乐里打字不会污染搜索页的查询。
+    pub local_filter_field: TextField,
+    /// 当前该由哪个输入框接收编辑键。
+    ///
+    /// 由各自的 `FocusHandle` 在渲染时置位；没有聚焦任何输入框时是 `None`，
+    /// 此时编辑动作静默丢弃（不会误改搜索框）。
+    pub active_input: Option<ActiveInput>,
+    pub local_filter_focus: FocusHandle,
     /// 搜索框文本区的窗口内 bounds：canvas 绘制时回填，鼠标点击定位用。
     pub(crate) search_bounds: std::rc::Rc<std::cell::Cell<Option<gpui::Bounds<gpui::Pixels>>>>,
     /// 当前鼠标拖拽是否按词扩选（双击起步的拖拽为真；松开鼠标复位）。
@@ -884,6 +907,9 @@ impl Root {
             pending_lyrics_scroll: None,
             lyrics_request_seq: 0,
             search_field: TextField::default(),
+            local_filter_field: TextField::default(),
+            active_input: None,
+            local_filter_focus: cx.focus_handle(),
             search_drag_by_word: false,
             search_edit_epoch: std::time::Instant::now(),
             search_bounds: std::rc::Rc::new(std::cell::Cell::new(None)),
@@ -1377,6 +1403,29 @@ impl Root {
 
 /// gpui 的输入协议桥：把平台的 UTF-16 区间换算交给 [`TextField`]，
 /// 这里只留「平台说了什么」→「状态怎么变」这一层，外加焦点门禁。
+///
+/// 两个输入框共用这套实现：每个方法先问「当前聚焦的是哪一个」，
+/// 再决定读写哪份 [`TextField`]。焦点门禁也分两路，避免过滤框拿到搜索框的候选窗。
+impl Root {
+    /// 当前聚焦的输入框；没聚焦任何一个时返回 `None`。
+    fn focused_input(&self, window: &Window) -> Option<ActiveInput> {
+        if self.search_focus.is_focused(window) {
+            Some(ActiveInput::Search)
+        } else if self.local_filter_focus.is_focused(window) {
+            Some(ActiveInput::LocalFilter)
+        } else {
+            None
+        }
+    }
+
+    fn focused_field_mut(&mut self, window: &Window) -> Option<&mut TextField> {
+        match self.focused_input(window)? {
+            ActiveInput::Search => Some(&mut self.search_field),
+            ActiveInput::LocalFilter => Some(&mut self.local_filter_field),
+        }
+    }
+}
+
 impl EntityInputHandler for Root {
     fn text_for_range(
         &mut self,
@@ -1385,12 +1434,10 @@ impl EntityInputHandler for Root {
         window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<String> {
-        if !self.search_input_focused(window) {
-            return None;
-        }
-        let range = self.search_field.byte_range_from_utf16(range_utf16);
-        actual_range.replace(self.search_field.utf16_range_from_byte(range.clone()));
-        Some(self.search_field.slice(range))
+        let field = self.focused_field_mut(window)?;
+        let range = field.byte_range_from_utf16(range_utf16);
+        actual_range.replace(field.utf16_range_from_byte(range.clone()));
+        Some(field.slice(range))
     }
 
     fn selected_text_range(
@@ -1399,16 +1446,12 @@ impl EntityInputHandler for Root {
         window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<UTF16Selection> {
-        if !self.search_input_focused(window) {
-            return None;
-        }
+        let field = self.focused_field_mut(window)?;
         // 组合中上报组合区间，否则上报选区（无选区时是活动端的折叠区间）。
         // `reversed` 要照实给：方向决定 Shift 继续扩选时往哪边长，macOS 的候选窗也读它。
         Some(UTF16Selection {
-            range: self
-                .search_field
-                .utf16_range_from_byte(self.search_field.selection_range()),
-            reversed: self.search_field.is_reversed(),
+            range: field.utf16_range_from_byte(field.selection_range()),
+            reversed: field.is_reversed(),
         })
     }
 
@@ -1417,16 +1460,21 @@ impl EntityInputHandler for Root {
         window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<std::ops::Range<usize>> {
-        if !self.search_input_focused(window) {
-            return None;
-        }
-        self.search_field
+        let input = self.focused_input(window)?;
+        let field = match input {
+            ActiveInput::Search => &self.search_field,
+            ActiveInput::LocalFilter => &self.local_filter_field,
+        };
+        field
             .marked()
-            .map(|range| self.search_field.utf16_range_from_byte(range))
+            .map(|range| field.utf16_range_from_byte(range))
     }
 
-    fn unmark_text(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        if self.search_field.clear_marked() {
+    fn unmark_text(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(field) = self.focused_field_mut(window) else {
+            return;
+        };
+        if field.clear_marked() {
             cx.notify();
         }
     }
@@ -1438,15 +1486,22 @@ impl EntityInputHandler for Root {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.search_input_focused(window) {
+        let Some(input) = self.focused_input(window) else {
             return;
-        }
-        let range = range_utf16.map(|range| self.search_field.byte_range_from_utf16(range));
+        };
         let now = self.search_edit_time();
-        self.search_field.begin_edit();
-        self.search_field.replace(range, text);
-        self.search_field.end_edit(now);
-        self.search_fit_caret_in_view(window);
+        {
+            let Some(field) = self.focused_field_mut(window) else {
+                return;
+            };
+            let range = range_utf16.map(|range| field.byte_range_from_utf16(range));
+            field.begin_edit();
+            field.replace(range, text);
+            field.end_edit(now);
+        }
+        if input == ActiveInput::Search {
+            self.search_fit_caret_in_view(window);
+        }
         cx.notify();
     }
 
@@ -1458,15 +1513,22 @@ impl EntityInputHandler for Root {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.search_input_focused(window) {
+        let Some(input) = self.focused_input(window) else {
             return;
-        }
-        let range = range_utf16.map(|range| self.search_field.byte_range_from_utf16(range));
+        };
         let now = self.search_edit_time();
-        self.search_field.begin_edit();
-        self.search_field.replace_and_mark(range, new_text);
-        self.search_field.end_edit(now);
-        self.search_fit_caret_in_view(window);
+        {
+            let Some(field) = self.focused_field_mut(window) else {
+                return;
+            };
+            let range = range_utf16.map(|range| field.byte_range_from_utf16(range));
+            field.begin_edit();
+            field.replace_and_mark(range, new_text);
+            field.end_edit(now);
+        }
+        if input == ActiveInput::Search {
+            self.search_fit_caret_in_view(window);
+        }
         cx.notify();
     }
 
@@ -1477,9 +1539,11 @@ impl EntityInputHandler for Root {
         window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<gpui::Bounds<gpui::Pixels>> {
-        if !self.search_input_focused(window) {
-            return None;
+        // 过滤框不做精确排版（见 `local_filter_box`），候选窗直接贴在整框上。
+        if self.focused_input(window) == Some(ActiveInput::LocalFilter) {
+            return Some(element_bounds);
         }
+        self.focused_input(window)?;
         // 候选窗要贴在真正在编辑的那一段下面：整框宽度当锚点会让候选窗一直停在框的左下，
         // 滚过长文本之后更是完全对不上。这里与 `search_cursor_for_x` 共用同一条排版结果。
         let range = self.search_field.byte_range_from_utf16(range_utf16);
@@ -1499,12 +1563,15 @@ impl EntityInputHandler for Root {
         window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<usize> {
-        if !self.search_input_focused(window) {
-            return None;
+        match self.focused_input(window)? {
+            // 过滤框没有排版结果，点击定位交给 `on_mouse_down` 的粗略处理。
+            ActiveInput::LocalFilter => None,
+            ActiveInput::Search => {
+                // 语义是 UTF-16 偏移：按点击位置算出字节下标后再换算。
+                let byte = self.search_cursor_for_x(point.x, window);
+                Some(self.search_field.byte_to_utf16(byte))
+            }
         }
-        // 语义是 UTF-16 偏移：按点击位置算出字节下标后再换算。
-        let byte = self.search_cursor_for_x(point.x, window);
-        Some(self.search_field.byte_to_utf16(byte))
     }
 
     fn set_selected_text_range(
@@ -1513,26 +1580,28 @@ impl EntityInputHandler for Root {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.search_input_focused(window) {
+        let Some(input) = self.focused_input(window) else {
             return;
-        }
-        let range = self.search_field.byte_range_from_utf16(range_utf16);
+        };
+        let Some(field) = self.focused_field_mut(window) else {
+            return;
+        };
+        let range = field.byte_range_from_utf16(range_utf16);
         // 平台交回的是整段区间，此前只取 `start` 会把选区丢掉；这里按真选区收下，
         // 活动端落在区间末尾（方向由两端的大小关系决定）。
-        self.search_field.set_position(range.end, range.start);
-        self.search_fit_caret_in_view(window);
+        field.set_position(range.end, range.start);
+        if input == ActiveInput::Search {
+            self.search_fit_caret_in_view(window);
+        }
         cx.notify();
     }
 
     fn text_length_utf16(&mut self, window: &mut Window, _cx: &mut Context<Self>) -> Option<usize> {
-        if !self.search_input_focused(window) {
-            return None;
-        }
-        Some(self.search_field.utf16_len())
+        Some(self.focused_field_mut(window)?.utf16_len())
     }
 
     fn accepts_text_input(&self, window: &mut Window, _cx: &mut Context<Self>) -> bool {
-        self.search_input_focused(window)
+        self.focused_input(window).is_some()
     }
 }
 

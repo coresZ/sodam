@@ -183,12 +183,12 @@ pub(crate) fn song_for(track: &crate::models::TrackItem) -> libresoda::Song {
     }
 }
 
-/// 把 `DownloadInfo` 翻成界面用的音质标签（以**实际拉到的流**为准）。
-pub(crate) fn describe_quality(info: &libresoda::soda::types::DownloadInfo) -> String {
-    let bitrate = info.bitrate.max(0) / 1000;
-    let lossless = libresoda::soda::quality::is_lossless(info)
-        || info.format.eq_ignore_ascii_case("flac")
-        || info.quality.to_ascii_lowercase().contains("lossless");
+/// 把「码率 + 是否无损」翻成界面用的音质标签（例：`无损 871k` / `极高 320k`）。
+///
+/// 单一入口：下载时的服务端 `DownloadInfo` 与「文件已存在时从磁盘反推」都走这里，
+/// 保证两边的档位阈值不会漂移。
+pub fn quality_label(bitrate_kbps: i64, lossless: bool) -> String {
+    let bitrate = bitrate_kbps.max(0);
     let tier = if lossless {
         "无损"
     } else if bitrate >= 300 {
@@ -207,6 +207,14 @@ pub(crate) fn describe_quality(info: &libresoda::soda::types::DownloadInfo) -> S
     } else {
         tier.to_string()
     }
+}
+
+/// 把 `DownloadInfo` 翻成界面用的音质标签（以**实际拉到的流**为准）。
+pub(crate) fn describe_quality(info: &libresoda::soda::types::DownloadInfo) -> String {
+    let lossless = libresoda::soda::quality::is_lossless(info)
+        || info.format.eq_ignore_ascii_case("flac")
+        || info.quality.to_ascii_lowercase().contains("lossless");
+    quality_label(info.bitrate / 1000, lossless)
 }
 
 /// 下载是否被截断：只看「实际字节数是否少于服务端声明」。

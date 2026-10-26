@@ -845,6 +845,31 @@ pub fn probe_duration(path: &std::path::Path) -> Option<f64> {
     (duration > 0.0).then_some(duration)
 }
 
+/// 从**磁盘上已有的音频文件**反推音质标签（例：`无损 871k`）。
+///
+/// 用途：下载时目标文件已存在、按策略跳过，没有走网络也就没有服务端下发的
+/// `DownloadInfo` —— 此时用「字节数 ÷ 时长」估平均码率，再按与
+/// [`crate::session::describe_quality`] 相同的档位阈值归档。
+///
+/// 这是**估算**：码率是整首平均值，且容器开销（MP4 的 moov/mdat 头）会让它略高于
+/// 实际音频码率。所以只用于「本来就没有准确值」的场景，不覆盖下载时拿到的真实值。
+///
+/// 时长取不到（没有容器头）时返回 `None`，调用方保留 `未知音质`。
+pub fn probe_quality_label(path: &std::path::Path) -> Option<String> {
+    let bytes = std::fs::metadata(path).ok()?.len();
+    let seconds = probe_duration(path)?;
+    if bytes == 0 || seconds <= 0.0 {
+        return None;
+    }
+    // 平均码率（kbps）：字节数 × 8 ÷ 时长 ÷ 1000。
+    let bitrate = (bytes as f64 * 8.0 / seconds / 1000.0).round() as i64;
+    let lossless = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("flac"));
+    (bitrate > 0).then(|| crate::session::quality_label(bitrate, lossless))
+}
+
 /// MP4 系容器的时长：定位 `moov/mvhd`，按 `duration / timescale` 算。
 ///
 /// 手写而不是走 rodio，是因为下载目录里这是**绝大多数**文件的格式，
@@ -1322,6 +1347,31 @@ mod tests {
         let path = dir.join("not-mp4.bin");
         std::fs::write(&path, b"RIFF____WAVEfmt ").expect("write");
         assert!(probe_mp4_duration(&path).is_none(), "非 MP4 不该给结果");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 跳过下载时从文件反推音质：用「字节数 ÷ 时长」估平均码率，再按档位归档。
+    #[test]
+    fn probe_quality_label_estimates_from_file_size_and_duration() {
+        let dir = std::env::temp_dir().join(format!("sodam-quality-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+
+        // 10 秒、8 字节/毫秒的一半 → 直接按目标码率算字节数：
+        // 码率 320kbps × 10s ÷ 8 = 400_000 字节。
+        let path = dir.join("song.m4a");
+        let mut bytes = fake_mp4(1000, 10_000, 0); // 10.000 秒
+        bytes.resize(400_000, 0);
+        std::fs::write(&path, &bytes).expect("write");
+
+        let label = probe_quality_label(&path).expect("应能估出音质");
+        assert!(label.starts_with("极高"), "320k 应归极高档，实际 {label}");
+        assert!(label.ends_with('k'), "带宽率后缀，实际 {label}");
+
+        // 时长探测不出来（不是有效容器）→ 给 None，调用方保留「未知音质」。
+        let broken = dir.join("broken.m4a");
+        std::fs::write(&broken, b"not a container at all").expect("write");
+        assert!(probe_quality_label(&broken).is_none());
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

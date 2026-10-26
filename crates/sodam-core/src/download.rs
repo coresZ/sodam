@@ -41,6 +41,12 @@ const FALLBACK_STEM: &str = "未知曲目";
 const MAX_SEGMENT_CHARS: usize = 80;
 /// 下载文件认识的音频扩展名（探测已存在文件 / 决定容器后缀）。
 const AUDIO_EXTENSIONS: &[&str] = &["m4a", "mp4", "flac", "mp3", "wav", "aac"];
+
+/// 目标文件已存在、且无法从文件本身探测出音质时的占位标签。
+///
+/// 它**不是音质**：写清单、界面展示都要把它当成「没有值」（见 `finish_task` 与
+/// `views::downloads`），只是先占着 `quality` 字段的位置。
+pub const EXISTING_PLACEHOLDER: &str = "已存在";
 /// 封面旁路子目录（`<下载根>/image/`）。
 ///
 /// 旁路固定落在**下载根**的子目录里，不跟随命名模板的 `/` 分层 ——
@@ -602,9 +608,12 @@ pub fn download_track(
                 .map(|meta| meta.len())
                 .unwrap_or(0);
             return Ok(TrackDownloadOutcome {
-                path: existing,
+                path: existing.clone(),
                 bytes,
-                quality: "已存在".to_string(),
+                // 没有走网络、拿不到服务端下发的音质：从文件本身反推一个估值，
+                // 探测不出来才退回「已存在」（界面显示为「未知音质」）。
+                quality: crate::audio::probe_quality_label(&existing)
+                    .unwrap_or_else(|| EXISTING_PLACEHOLDER.to_string()),
                 skipped: true,
                 cover: None,
                 lyrics: None,
@@ -1613,20 +1622,23 @@ fn finish_task(
                 };
                 task.finished_at = Some(Instant::now());
                 // 「本地音乐」页跨重启的依据。
-                // 文件本就在（按策略跳过）也记一条 —— 老版本留下的文件借此补进清单，
-                // 但那种情况下质量未知，留空而不是把「已存在」当成音质写进去。
+                // 文件本就在（按策略跳过）也记一条 —— 老版本留下的文件借此补进清单。
+                // 跳过时 `quality` 是从磁盘反推的估值（探测不出来则是「已存在」占位符，
+                // 不能当音质写进去）。
                 let extension = outcome
                     .path
                     .extension()
                     .and_then(|value| value.to_str())
                     .unwrap_or_default()
                     .to_string();
+                let quality =
+                    (outcome.quality != EXISTING_PLACEHOLDER).then_some(outcome.quality.as_str());
                 entry = Some(LibraryEntry::from_download(
                     &task.track,
                     render_relative_path(download.naming(), &task.track),
                     &extension,
                     outcome.bytes,
-                    (!outcome.skipped).then_some(outcome.quality.as_str()),
+                    quality,
                     &outcome.path,
                 ));
                 if !outcome.skipped {

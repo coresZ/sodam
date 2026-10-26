@@ -99,7 +99,13 @@ pub(crate) fn row_labels(root: &Root, task: &DownloadTask) -> RowLabels {
             ..
         } => {
             if *skipped {
-                root.localized("已存在 · {}", std::slice::from_ref(quality))
+                // 跳过时 `quality` 要么是从文件反推的估值，要么是「已存在」占位符
+                // （探测不出时长）。后者已经由前缀表达，不再重复一遍。
+                if quality == sodam_core::download::EXISTING_PLACEHOLDER {
+                    root.tr("已存在").to_string()
+                } else {
+                    root.localized("已存在 · {}", std::slice::from_ref(quality))
+                }
             } else {
                 format!("{} · {}", human_bytes(*bytes), quality)
             }

@@ -5,7 +5,7 @@
 use crate::ui::i18n::Language;
 use crate::ui::theme::{self, ThemeKind};
 use gpui::prelude::*;
-use gpui::{Context, Window};
+use gpui::Context;
 use sodam_core::audio::PlaybackSnapshot;
 use sodam_core::failure::{PlayBudget, PlaybackFailure, RecoveryAction, Retryability, Stage};
 use sodam_core::library::RecommendationSource;
@@ -66,9 +66,6 @@ impl Root {
     /// UI 用：这一行是不是本地文件（本地曲目按定义就在磁盘上）。
     pub(crate) fn is_local_track(&self, track: &TrackItem) -> bool {
         is_local_track(track)
-    }
-    pub(crate) fn search_input_focused(&self, window: &Window) -> bool {
-        self.search_focus.is_focused(window)
     }
 
     /// 预取队列接下来几首到本地缓存（只落盘，不动界面状态）。
@@ -2338,6 +2335,20 @@ impl Root {
             self.lyrics_track_id = track.id.clone();
             self.lyrics = Arc::new(lines);
         }
+    }
+
+    /// 右键菜单里「匹配」类入口不可用时的统一提示。
+    ///
+    /// 不做静默置灰：用户点下去没反应会以为功能坏了（本次就踩过）。
+    /// `logged_in` 决定提示哪一种原因 —— 未登录是前提条件，优先级更高。
+    pub(crate) fn hint_cannot_match(&mut self, logged_in: bool) {
+        let message = if !logged_in {
+            self.tr("登录后才能匹配本地文件").to_string()
+        } else {
+            self.tr("这首已经匹配过了，不必再匹配").to_string()
+        };
+        self.status = message.clone();
+        self.notify_warning_once("local-match-unavailable", message);
     }
 
     /// 单条「匹配信息」：拿文件名搜汽水，够可信才写回清单。

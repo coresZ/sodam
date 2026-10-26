@@ -1320,7 +1320,7 @@ pub fn render(root: &mut Root, window: &Window, cx: &mut Context<Root>) -> impl 
         Nav::Album => search::album_page(root, cx),
         Nav::Settings => settings::settings_view(root, cx),
         Nav::Lyrics => lyrics::lyrics_view(root, window, cx),
-        Nav::Local => local_music::local_music_page(root, cx),
+        Nav::Local => local_music::local_music_page(root, window, cx),
     };
 
     div()

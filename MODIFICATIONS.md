@@ -1110,3 +1110,77 @@ seek 之后 `PlayReporter::played_ms` 不重置 —— 属 `main` 的既有口�
 - 验证：`cargo check --workspace` / `clippy --workspace --all-targets -D warnings` /
   `fmt --all -- --check` 通过；`cargo test --workspace` 73 + 103 通过。
   `target/debug/sodam.exe` 已重建为 v0.3.5。
+
+## 2026-10-26 — 跳过下载时从文件反推音质
+
+用户现象：下载一首已存在的歌后，播放时显示「未知音质」。
+
+**根因**：`download.rs` 的「目标文件已存在 → 跳过」分支没有走网络，拿不到服务端的
+`DownloadInfo`，`quality` 只能写占位符「已存在」；而写清单时又刻意把跳过项的质量留空
+（`(!outcome.skipped).then_some(...)`），于是 `LibraryEntry.quality = None`。
+播放时 `local_quality_for` 取不到值，兜底成「未知音质」。
+
+**改法**（下载线程里做，不进渲染路径）：
+
+- `audio.rs` 新增 `probe_quality_label(path)`：用「文件字节数 ÷ 探测时长」估平均码率，
+  再按档位归档。时长复用已有的 `probe_duration`（MP4 走手写 mvhd，其它容器走 rodio）。
+- `session.rs` 抽出 `quality_label(bitrate_kbps, lossless)`：服务端 `describe_quality`
+  与文件探测共用同一套阈值，避免两边漂移。
+- `download.rs`：跳过分支改为 `probe_quality_label(&existing)`，探测不出才退回
+  占位符 `EXISTING_PLACEHOLDER`；写清单时只排除这个占位符，真实估值照常写入。
+- `views/downloads.rs`：跳过行若已有估值显示「已存在 · 无损 871k」；
+  仍是占位符时只显示「已存在」，不重复。
+- `ui/i18n.rs`：补 `已存在` 的英文词条。
+
+**已知取舍**：估的是整首平均码率，容器开销会让它略高于实际音频码率；
+只用于「本来就没有准确值」的跳过场景，不覆盖下载时拿到的真实 `DownloadInfo`。
+
+**验证**：`cargo check` / `clippy -D warnings` / `fmt --check` 通过；
+`cargo test --workspace` 95 + 174 + 2 通过（新增 `probe_quality_label_estimates_from_file_size_and_duration`）。
+**UI 未做真机验证**。
+
+## 2026-10-26 — 本地音乐搜索 + 输入框按焦点分发
+
+用户反馈「本地音乐里还没有搜索」。加过滤框时暴露出一个结构问题：文本编辑动作原本
+全部硬编码到 `search_field`，第二个输入框无法复用。
+
+### 输入框分发（`app_text.rs` / `app.rs`）
+
+- `app.rs` 新增 `ActiveInput { Search, LocalFilter }` 与 `local_filter_field` /
+  `local_filter_focus` / `active_input`。
+- `app_text.rs` 的 `edit_text` / `text_undo` / `text_redo` / `text_cancel` 改走
+  **唯一入口** `Root::active_field_mut()`：按 `active_input` 选字段，不再固定
+  `search_field`。`text_submit` 只对搜索页触发生效（过滤框即时生效）。
+- `EntityInputHandler` 的 8 个方法也改为按焦点分发（新增 `focused_input` /
+  `focused_field_mut`）；过滤框不做精确排版，`bounds_for_range` 直接返回整框、
+  `character_index_for_point` 返回 `None`。
+- 删掉 `Root::search_input_focused`（已被 `focused_input` 取代）。
+
+### 过滤框（`views/local_music.rs`）
+
+- 新增 `local_filter_box`：位于「本地音乐」工具栏左侧，**始终显示**（原先工具栏在
+  没有待匹配文件时直接返回空）。宽 280，高 32。
+- 编辑键必须逐条 `.on_action(...)`（23 条，与搜索框一致）——keymap 动作找不到接收者
+  会静默丢弃。**少了它们表现为「能打字但退格无效」**：字符输入走
+  `EntityInputHandler`，删除键走 action，两条路互不相干。
+- 字符输入：`canvas` 的 **paint** 阶段调 `window.handle_input`。放进 prepaint 会
+  栈溢出崩溃（`c0000409`，本次踩过）。
+- `local_file_matches`：按标题 / 歌手 / 文件名做不区分大小写的子串匹配；
+  无匹配时显示「没有匹配「{}」的文件」。
+- `local_music_page` 增加 `window` 参数（过滤框要判断焦点）。
+
+### 匹配入口的提示（`views/local_music.rs` / `app_actions.rs`）
+
+右键菜单的「匹配信息 / 手动选择匹配」在不可用时原来只是置灰、点了没反应。
+新增 `Root::hint_cannot_match(logged_in)`，按原因提示「登录后才能匹配本地文件」或
+「这首已经匹配过了，不必再匹配」，同时写 `status` 与 `notify_warning_once`。
+「补全信息」按钮同样补上未登录提示。
+
+### 验证
+
+- `cargo check` / `clippy --workspace --all-targets -D warnings` / `fmt --check` 通过。
+- `cargo test --workspace`：96 + 174 + 2 通过（新增
+  `local_filter_matches_title_artist_and_file_name`）。
+- 真机确认：过滤框可输入、可退格、可全选/复制粘贴；「本地音乐」页不再崩溃。
+- **残留限制**：过滤框不画选区高亮、光标用等宽近似定位（`caret * 7px`）、
+  不支持横向滚动。要精确需把搜索框那套绘制抽成共用组件。

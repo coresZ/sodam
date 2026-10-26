@@ -24,8 +24,8 @@ use std::sync::{Arc, Mutex};
 
 use gpui::prelude::*;
 use gpui::{
-    div, point, px, svg, uniform_list, AnyElement, ClickEvent, Context, IntoElement, MouseButton,
-    MouseDownEvent,
+    canvas, div, point, px, svg, uniform_list, AnyElement, ClickEvent, Context, IntoElement,
+    MouseButton, MouseDownEvent, Window,
 };
 
 use crate::app::{DownloadTab, LocalFile, LocalTab, Root};
@@ -53,7 +53,7 @@ const PROGRESS_W: f32 = 160.0;
 // ---------------------------------------------------------------------------
 
 /// 本地音乐页。
-pub(crate) fn local_music_page(root: &Root, cx: &mut Context<Root>) -> AnyElement {
+pub(crate) fn local_music_page(root: &Root, window: &Window, cx: &mut Context<Root>) -> AnyElement {
     let tabs = segmented(
         "local-tab",
         vec![
@@ -83,7 +83,7 @@ pub(crate) fn local_music_page(root: &Root, cx: &mut Context<Root>) -> AnyElemen
         .gap(px(theme::space::LG))
         .child(tabs)
         .when(root.local_tab == LocalTab::Songs, |this| {
-            this.child(songs_toolbar(root, cx))
+            this.child(songs_toolbar(root, window, cx))
         })
         .child(body)
         .into_any_element()
@@ -92,7 +92,7 @@ pub(crate) fn local_music_page(root: &Root, cx: &mut Context<Root>) -> AnyElemen
 /// 「本地音乐」的工具栏：批量「补全信息」+ 进度。
 ///
 /// 只在有**待匹配**文件（没有汽水 id 的）时显示按钮，避免空页面挂个没用的入口。
-fn songs_toolbar(root: &Root, cx: &mut Context<Root>) -> AnyElement {
+fn songs_toolbar(root: &Root, window: &Window, cx: &mut Context<Root>) -> AnyElement {
     let pending = root
         .local_files
         .iter()
@@ -104,22 +104,32 @@ fn songs_toolbar(root: &Root, cx: &mut Context<Root>) -> AnyElement {
         })
         .count();
 
-    let mut toolbar = div()
+    // 过滤框始终在：它是这个页面的基础操作，不该依赖「有没有待匹配文件」。
+    let toolbar = div()
         .flex()
         .flex_row()
         .items_center()
         .gap(px(theme::space::MD))
-        .min_h(px(theme::size::CONTROL_SM));
+        .min_h(px(theme::size::CONTROL_SM))
+        .child(
+            div()
+                .w(px(280.0))
+                .flex_none()
+                .child(local_filter_box(root, window, cx)),
+        );
 
     if let Some((done, total)) = root.matching {
         // 匹配进行中：显示进度，按钮禁用（避免重复触发）
-        toolbar = toolbar.child(
-            div()
-                .text_size(theme::Text::Small.size())
-                .text_color(theme::text_muted())
-                .child(root.localized("正在匹配：{}/{}", &[done.to_string(), total.to_string()])),
-        );
-        return toolbar.into_any_element();
+        return toolbar
+            .child(
+                div()
+                    .text_size(theme::Text::Small.size())
+                    .text_color(theme::text_muted())
+                    .child(
+                        root.localized("正在匹配：{}/{}", &[done.to_string(), total.to_string()]),
+                    ),
+            )
+            .into_any_element();
     }
 
     if pending == 0 {
@@ -151,6 +161,9 @@ fn songs_toolbar(root: &Root, cx: &mut Context<Root>) -> AnyElement {
                 .on_click(cx.listener(move |root, _event: &ClickEvent, _window, cx| {
                     if can_match {
                         root.match_all_local_files(cx);
+                    } else {
+                        root.hint_cannot_match(false);
+                        cx.notify();
                     }
                 }))
                 .child(
@@ -294,10 +307,166 @@ fn label_from_seconds(seconds: i64) -> String {
 // 本地音乐（磁盘真相）
 // ---------------------------------------------------------------------------
 
+/// 「本地音乐」的过滤框。
+///
+/// 编辑键走 `app_text`（与搜索页共用一套动作），但绘制是简化版：只画文本与光标，
+/// 不做选区高亮与横向滚动 —— 本地文件名通常很短，超出宽度由 `truncate` 兜底。
+fn local_filter_box(root: &Root, window: &Window, cx: &mut Context<Root>) -> AnyElement {
+    let focused = root.local_filter_focus.is_focused(window);
+    let empty = root.local_filter_field.is_empty();
+    let text = root.local_filter_field.text().to_string();
+    let caret = root.local_filter_field.caret();
+    let color = if empty {
+        theme::text_muted()
+    } else {
+        theme::text()
+    };
+    let placeholder = root.tr("过滤本地音乐：标题、歌手或文件名").to_string();
+
+    div()
+        .id("local-filter")
+        .track_focus(&root.local_filter_focus)
+        .key_context(crate::shortcuts::INPUT_CONTEXT)
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(theme::space::SM))
+        .h(px(32.0))
+        .px(px(theme::space::MD))
+        .rounded(px(theme::radius::ROW))
+        .bg(theme::surface())
+        .border_1()
+        .border_color(if focused {
+            theme::accent()
+        } else {
+            theme::border()
+        })
+        .text_size(theme::Text::Small.size())
+        .text_color(color)
+        .cursor_text()
+        .child(
+            svg()
+                .path(icons::path("search"))
+                .size(px(theme::ICON_SM))
+                .text_color(theme::text_muted()),
+        )
+        .child(
+            div()
+                .relative()
+                .flex_1()
+                .min_w(px(0.0))
+                .truncate()
+                .child(if empty { placeholder } else { text.clone() }),
+        )
+        .when(focused && !empty, |this| {
+            // 光标：用等宽近似定位（不追求与字形精确对齐），本地过滤框足够用。
+            let offset = caret as f32 * 7.0;
+            this.child(
+                div()
+                    .absolute()
+                    .left(px(offset))
+                    .h(px(14.0))
+                    .w(px(1.0))
+                    .bg(theme::accent()),
+            )
+        })
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|root, _event: &MouseDownEvent, window, cx| {
+                window.focus(&root.local_filter_focus, cx);
+                root.active_input = Some(crate::app::ActiveInput::LocalFilter);
+                cx.notify();
+            }),
+        )
+        // 编辑键：与搜索框同一套动作（`app_text`），处理器按 `active_input` 分发到本字段。
+        // 这些是 keymap 动作，**没有 on_action 就没有接收者** —— 少了它们会表现为
+        // 「能打字但退格无效」（字符输入走 EntityInputHandler，与这里无关）。
+        .on_action(cx.listener(Root::text_backspace))
+        .on_action(cx.listener(Root::text_delete))
+        .on_action(cx.listener(Root::text_delete_word_backward))
+        .on_action(cx.listener(Root::text_left))
+        .on_action(cx.listener(Root::text_right))
+        .on_action(cx.listener(Root::text_word_left))
+        .on_action(cx.listener(Root::text_word_right))
+        .on_action(cx.listener(Root::text_select_left))
+        .on_action(cx.listener(Root::text_select_right))
+        .on_action(cx.listener(Root::text_select_word_left))
+        .on_action(cx.listener(Root::text_select_word_right))
+        .on_action(cx.listener(Root::text_home))
+        .on_action(cx.listener(Root::text_end))
+        .on_action(cx.listener(Root::text_select_home))
+        .on_action(cx.listener(Root::text_select_end))
+        .on_action(cx.listener(Root::text_select_all))
+        .on_action(cx.listener(Root::text_copy))
+        .on_action(cx.listener(Root::text_cut))
+        .on_action(cx.listener(Root::text_paste))
+        .on_action(cx.listener(Root::text_undo))
+        .on_action(cx.listener(Root::text_redo))
+        .on_action(cx.listener(Root::text_submit))
+        .on_action(cx.listener(Root::text_cancel))
+        .child({
+            // 字符输入走 gpui 的输入协议：必须在**绘制阶段**登记 InputHandler，
+            // 否则按键字符进不了这个框（只剩 `on_action` 管的那几个编辑键）。
+            // 与搜索框一致：登记放在 prepaint 里会让 `handle_input` 在布局阶段重入。
+            let input_focus = root.local_filter_focus.clone();
+            let input_entity = cx.entity();
+            canvas(
+                |bounds: gpui::Bounds<gpui::Pixels>, _window, _cx| bounds,
+                move |bounds: gpui::Bounds<gpui::Pixels>, _state, window, cx| {
+                    window.handle_input(
+                        &input_focus,
+                        gpui::ElementInputHandler::new(bounds, input_entity.clone()),
+                        cx,
+                    );
+                },
+            )
+            .absolute()
+            .size_full()
+        })
+        .into_any_element()
+}
+
+/// 过滤匹配：标题 / 歌手 / 文件名任一命中即可（`query` 已是小写）。
+fn local_file_matches(file: &LocalFile, query: &str) -> bool {
+    let entry = file.entry.as_ref();
+    let title = entry
+        .map(|entry| entry.display_title())
+        .unwrap_or_else(|| display_stem(&file.relative));
+    let artist = entry
+        .map(|entry| entry.display_artist())
+        .unwrap_or_default();
+    let file_name = file
+        .relative
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_default();
+    [title, artist, file_name]
+        .iter()
+        .any(|value| value.to_lowercase().contains(query))
+}
+
 fn songs_view(root: &Root, cx: &mut Context<Root>) -> AnyElement {
-    let files = root.local_files.clone();
-    if files.is_empty() {
+    if root.local_files.is_empty() {
         return empty_state("disc-3", root.tr("下载目录里还没有音频文件"));
+    }
+
+    // 过滤：按「标题 / 歌手 / 文件名」做不区分大小写的子串匹配。
+    // 过滤框为空时保持原样（不过滤，也不重排）。
+    let query = root.local_filter_field.text().trim().to_lowercase();
+    let files: Arc<Vec<LocalFile>> = if query.is_empty() {
+        root.local_files.clone()
+    } else {
+        Arc::new(
+            root.local_files
+                .iter()
+                .filter(|file| local_file_matches(file, &query))
+                .cloned()
+                .collect::<Vec<_>>(),
+        )
+    };
+    if files.is_empty() {
+        let message = root.localized("没有匹配「{}」的文件", std::slice::from_ref(&query));
+        return empty_state("search", &message);
     }
 
     let entity = cx.entity();
@@ -713,13 +882,15 @@ pub(crate) fn local_menu(root: &Root, cx: &mut Context<Root>) -> AnyElement {
                 .map(|name| name.to_string_lossy().to_string())
                 .unwrap_or_default()
         });
+    // 两种情况不能匹配，但**都要给出原因**——静默置灰看起来就像功能坏了。
+    let logged_in = !root.settings.cookie.trim().is_empty();
     // 已经有汽水 id 的文件不必再匹配（重复匹配只会浪费接口）。
     let already_matched = file
         .as_ref()
         .and_then(|file| file.entry.as_ref())
         .and_then(|entry| entry.track_id.as_ref())
         .is_some();
-    let can_match = !already_matched && !root.settings.cookie.trim().is_empty();
+    let can_match = !already_matched && logged_in;
 
     gpui::deferred(
         gpui::anchored()
@@ -774,6 +945,7 @@ pub(crate) fn local_menu(root: &Root, cx: &mut Context<Root>) -> AnyElement {
                                     if can_match {
                                         root.match_local_file(relative.clone(), cx);
                                     } else {
+                                        root.hint_cannot_match(logged_in);
                                         cx.notify();
                                     }
                                 }
@@ -812,6 +984,7 @@ pub(crate) fn local_menu(root: &Root, cx: &mut Context<Root>) -> AnyElement {
                                     if can_match {
                                         root.open_match_picker(relative.clone(), cx);
                                     } else {
+                                        root.hint_cannot_match(logged_in);
                                         cx.notify();
                                     }
                                 }
@@ -994,10 +1167,36 @@ pub(crate) fn match_picker(root: &Root, cx: &mut Context<Root>) -> AnyElement {
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_cover;
+    use super::{local_file_matches, resolve_cover};
+    use crate::app::LocalFile;
     use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::Mutex;
+
+    fn local_file(relative: &str) -> LocalFile {
+        LocalFile {
+            entry: None,
+            relative: PathBuf::from(relative),
+            extension: "m4a".to_string(),
+            bytes: 0,
+            probed_duration: None,
+            cover_path: None,
+            lyrics_path: None,
+        }
+    }
+
+    /// 过滤框按「标题 / 歌手 / 文件名」匹配，且不区分大小写。
+    #[test]
+    fn local_filter_matches_title_artist_and_file_name() {
+        let file = local_file("Artist Name - Song Title.m4a");
+        assert!(local_file_matches(&file, "song"));
+        assert!(local_file_matches(&file, "artist"));
+        // 文件名里的扩展名也能命中（用户可能就记得 ".m4a" 这一串）
+        assert!(local_file_matches(&file, ".m4a"));
+        // 大小写不敏感：调用方传进来的 query 已经 to_lowercase，值侧也要跟着降。
+        assert!(local_file_matches(&file, "SONG".to_lowercase().as_str()));
+        assert!(!local_file_matches(&file, "不存在的关键词"));
+    }
 
     fn covers_with(url: &str, path: &str) -> HashMap<String, PathBuf> {
         let mut covers = HashMap::new();
