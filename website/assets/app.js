@@ -232,6 +232,53 @@ function renderChangelog() {
     .join("");
 }
 
+/* ---------------- 主题切换 ---------------- */
+
+// 三种状态各一个图标：半填充圆 = 跟随系统，太阳 = 浅色，弯月 = 深色。
+const THEME_ICONS = {
+  auto:
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true" focusable="false">' +
+    '<circle cx="12" cy="12" r="9"/><path d="M12 3a9 9 0 0 1 0 18z" fill="currentColor" stroke="none"/></svg>',
+  light:
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true" focusable="false">' +
+    '<circle cx="12" cy="12" r="4.2"/>' +
+    '<path d="M12 2.6v2.3M12 19.1v2.3M2.6 12h2.3M19.1 12h2.3M5.3 5.3l1.6 1.6M17.1 17.1l1.6 1.6M18.7 5.3l-1.6 1.6M6.9 17.1l-1.6 1.6"/></svg>',
+  dark:
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" aria-hidden="true" focusable="false">' +
+    '<path d="M20.5 14.6A8.8 8.8 0 0 1 9.4 3.5a8.8 8.8 0 1 0 11.1 11.1z"/></svg>',
+};
+
+/** 把主题按钮挂到导航栏（样式见 style.css 的 .theme-toggle） */
+function mountThemeToggle() {
+  const bar = $("header .nav");
+  const theme = window.SodamTheme;
+  if (!bar || !theme) return;
+
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "theme-toggle";
+  btn.dataset.themeToggle = "";
+  btn.innerHTML =
+    '<span class="theme-toggle-icon"></span><span class="theme-toggle-label"></span>';
+
+  const icon = $(".theme-toggle-icon", btn);
+  const label = $(".theme-toggle-label", btn);
+
+  const render = (mode) => {
+    icon.innerHTML = THEME_ICONS[mode] || THEME_ICONS.auto;
+    label.textContent = theme.LABELS[mode] || "";
+    // 悬停提示写「当前状态 + 点击后是什么」，比只写“切换主题”更能预期
+    const next = theme.MODES[(theme.MODES.indexOf(mode) + 1) % theme.MODES.length];
+    btn.title = `${theme.TITLES[mode]}（点击切换为${theme.LABELS[next]}）`;
+    btn.setAttribute("aria-label", `${theme.TITLES[mode]}，点击切换主题`);
+  };
+
+  render(theme.current());
+  theme.onChange(render);
+  btn.addEventListener("click", () => theme.cycle());
+  bar.appendChild(btn);
+}
+
 /* ---------------- 启动 ---------------- */
 
 (async function boot() {
@@ -240,5 +287,6 @@ function renderChangelog() {
   await fillDownloadLinks();
   highlightPlatform();
   renderChangelog();
+  mountThemeToggle();
   wireCopyButtons();
 })();
