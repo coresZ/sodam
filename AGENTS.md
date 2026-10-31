@@ -44,8 +44,8 @@ packaging/windows/       Windows 安装器脚本与本机验收注意事项
    `cx.background_spawn` 或专用线程，结果回 UI 后 `cx.notify()`。
 3. **状态只有一处**：播放、队列、导航、设置都由 `Root` 或 `sodam-core` 模型持有；
    UI 只读状态、生成元素、派发动作。
-4. **错误不 panic**：网络/配置错误写入 `Root::status` 或页面提示；只有启动期不可恢复
-   错误才允许 panic。
+4. **错误不 panic**：网络/配置错误写入状态行（`Root::status_line`，见 `set_status_text`）
+   或页面提示；只有启动期不可恢复错误才允许 panic。
 5. **凭据不入库、不入日志**：Cookie、签名 Token、抓包签名头、真实设备指纹禁止提交或打印。
 6. **UI 改动必须真机验证**：使用 `scripts/run.sh` 启动确认，不能只过 `cargo check`。
 7. **提交前必须跑** `scripts/check.sh`（check + fmt + clippy + test，并带资源护栏）。

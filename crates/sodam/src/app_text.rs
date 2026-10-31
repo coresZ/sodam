@@ -351,7 +351,8 @@ impl Root {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.nav = Nav::Search;
+        // 走统一页面切换：状态行、录制态这些「页内残留」都由 `on_nav_changed` 收走。
+        self.set_nav(Nav::Search, cx);
         self.search_focus_pending = true;
         cx.notify();
     }

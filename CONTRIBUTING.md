@@ -51,8 +51,8 @@ scripts/run.sh     # 启动 GUI（带 MemoryMax 护栏）
    或专用线程，结果回 UI 后 `cx.notify()`。
 3. **状态只有一处**：播放、队列、导航、设置都由 `Root` 或 core 模型持有；UI 只读状态、
    生成元素、派发动作。
-4. **错误不 panic**：网络/配置错误写进 `Root::status` 或页面提示；只有启动期不可恢复
-   错误才允许 panic。
+4. **错误不 panic**：网络/配置错误写进状态行（`Root::status_line`，见 `set_status_text`）
+   或页面提示；只有启动期不可恢复错误才允许 panic。
 5. **凭据不入库、不入日志**：Cookie、签名 Token、抓包签名头、真实设备指纹禁止提交或打印。
 6. **界面文案走 i18n**：新增用户可见文案用 `root.tr` / `root.localized`，中文原文作为
    稳定 key，并同步英文词典。

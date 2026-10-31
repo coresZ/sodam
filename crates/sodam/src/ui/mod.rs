@@ -8,6 +8,7 @@ pub mod message;
 pub mod player_bar;
 pub mod sidebar;
 pub mod spinner;
+pub mod status_line;
 pub mod switch;
 pub mod text_field;
 pub mod theme;

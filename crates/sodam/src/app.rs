@@ -237,10 +237,8 @@ pub struct Root {
     pub queue: Queue,
     pub queue_origin: QueueOrigin,
     pub playing: bool,
-    pub status: String,
-    /// 全局轻提示：每次 status 更新都递增序号，并记录起始时间。
-    pub(crate) status_seq: u64,
-    pub(crate) status_since: Option<std::time::Instant>,
+    /// 底部状态行：普通操作反馈的文案与生命周期（渲染见 `ui::status_line`）。
+    pub(crate) status_line: ui::status_line::StatusLine,
     /// 全局 message 队列与计时去重集合。
     pub(crate) messages: Vec<ui::message::Message>,
     pub(crate) next_message_id: u64,
@@ -539,6 +537,10 @@ impl Root {
                 "Not ready: set Cookie and signer URL in Settings (or use SODA_COOKIE / QISHUI_SIGNER_URL)".to_string()
             }
         };
+        // 启动文案是写死的常量，不含接口地址，不需要脱敏；构造期也还没有 `Root`，
+        // 直接放进状态行即可，不必绕 `remember_status`。
+        let mut status_line = ui::status_line::StatusLine::default();
+        status_line.set(status);
         let mut queue = Queue::new(Vec::<TrackItem>::new());
         // 播放模式跨启动保留（设置页没做这一项，按钮在播放栏）。
         queue.mode = settings.play_mode;
@@ -582,9 +584,7 @@ impl Root {
             switching_label: language.text("推荐队列").to_string(),
             recommendation_request_seq: 0,
             recommendation_load_seq: 0,
-            status,
-            status_seq: 0,
-            status_since: None,
+            status_line,
             messages: Vec::new(),
             next_message_id: 0,
             message_timers: HashSet::new(),
@@ -1361,9 +1361,22 @@ impl Root {
     }
 
     /// 普通操作反馈：只进入底部状态行，不触发全局 message。
+    ///
+    /// 只写状态，不负责重绘——调用方照常 `cx.notify()`（现有写入点都在用户动作或
+    /// 后台回调里，本身就会跟着重绘）。
     pub fn set_status_text(&mut self, text: impl Into<String>) {
-        self.status = sodam_core::failure::strip_urls_for_user(&text.into());
-        self.show_status();
+        self.remember_status(text);
+    }
+
+    /// 写入状态行，并把摘掉接口地址之后的文案交回去。
+    ///
+    /// 提示通道要与状态行同一句，所以两边共用这一处脱敏与写入，不各自再拼一遍。
+    fn remember_status(&mut self, text: impl Into<String>) -> String {
+        // 内部端点对普通用户既无意义又泄露拓扑；带签名 token 的查询串更早就不该出现。
+        // 给维护者看的原文留给日志（`PlaybackFailure::detail`）。
+        let text = sodam_core::failure::strip_urls_for_user(&text.into());
+        self.status_line.set(text.clone());
+        text
     }
 
     /// 技术原文的唯一去处：诊断日志（默认开，写在本机日志目录）。
@@ -1435,22 +1448,10 @@ impl Root {
         text: String,
         key: Option<&str>,
     ) -> u64 {
-        // 上屏前摘掉接口地址：内部端点对普通用户既无意义又泄露拓扑；带签名 token 的查询串
-        // 更早就不该出现。给维护者看的原文留给日志（`PlaybackFailure::detail`）。
-        self.status = sodam_core::failure::strip_urls_for_user(&text);
-        self.show_status();
-        self.push_message_with_key(
-            kind,
-            self.status.clone(),
-            Some(ui::message::DEFAULT_DURATION),
-            key,
-        )
-    }
-
-    /// 记录最新状态。
-    pub(crate) fn show_status(&mut self) {
-        self.status_seq = self.status_seq.wrapping_add(1);
-        self.status_since = Some(std::time::Instant::now());
+        // 两条通道拿同一句文案（脱敏与写入都由 `remember_status` 负责），
+        // 轻提示 3 秒就走，状态行留到 5 秒。
+        let message = self.remember_status(text);
+        self.push_message_with_key(kind, message, Some(ui::message::DEFAULT_DURATION), key)
     }
 
     pub fn set_language(&mut self, language: Language, cx: &mut Context<Self>) {
@@ -1681,6 +1682,11 @@ impl Render for Root {
                     }),
             )
             .child(ui::player_bar::render(self, cx))
+            // 普通操作反馈的固定出口：播放栏上方的一行状态。绝对定位，出现与消失
+            // 都不推挤页面；层级在弹层之下，所以菜单、遮罩、message 都压得住它。
+            .when_some(ui::status_line::render(self, cx), |this, status| {
+                this.child(status)
+            })
             // 标题栏覆盖在各面板背景之上；不再单独占一行而截断侧栏底色。
             // 放在普通内容之后、弹层之前，控制按钮可点击，弹层仍能覆盖标题栏。
             .when(own_titlebar, |this| {

@@ -444,6 +444,8 @@ pub const SIDEBAR_W: f32 = 216.0;
 pub const TOOLBAR_H: f32 = 48.0;
 /// 底部播放条高度。
 pub const PLAYER_H: f32 = 76.0;
+/// 底部状态行的最大宽度：再长就省略，别横穿整个内容区。
+pub const STATUS_LINE_MAX_W: f32 = 520.0;
 
 /// 图标尺寸：导航与按钮统一 16，播放控制 20。
 pub const ICON_SM: f32 = 14.0;

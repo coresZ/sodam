@@ -289,8 +289,6 @@ impl Language {
             "当前跟随系统偏好，手动选择后会固定主题" => {
                 "Following system; choose a theme to pin it"
             }
-            "深色" => "Dark",
-            "浅色" => "Light",
             "语言" => "Language",
             "跟随系统" => "System",
             "音质偏好" => "Audio Quality",
@@ -393,8 +391,6 @@ impl Language {
             "已登录：{}（{}）" => "Signed in: {} ({})",
             "非 VIP" => "Non-VIP",
             "主题已切换为{}" => "Theme switched to {}",
-            "浅色" => "light",
-            "深色" => "dark",
             "主题已恢复为跟随系统" => "Theme restored to system",
             "正在读取「{}」歌词…" => "Loading lyrics for “{}”…",
             "「{}」没有可用歌词" => "No lyrics available for “{}”",
