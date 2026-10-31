@@ -60,6 +60,7 @@ fn search_box(root: &Root, window: &Window, cx: &mut Context<Root>) -> impl Into
             MouseButton::Left,
             cx.listener(|root, event: &MouseDownEvent, window, cx| {
                 window.focus(&root.search_focus, cx);
+                root.active_input = Some(crate::app::ActiveInput::Search);
                 // 单击定位插入点、双击选词、三击全选（Chromium 的单行框三击就是全选）。
                 let changed =
                     root.search_pointer_down(event.position.x, event.click_count, window);
@@ -595,6 +596,7 @@ fn search_track_row(
         cols,
         tracks,
         root.liked_ids.clone(),
+        root.downloaded.clone(),
         root.covers.clone(),
         root.cover_requests.clone(),
         root.queue.current().map(|track| track.id.clone()),
@@ -705,6 +707,7 @@ fn search_results_view(root: &Root, cx: &mut Context<Root>) -> AnyElement {
                     Nav::Search,
                     None,
                     root.liked_ids.clone(),
+                    root.downloaded.clone(),
                     root.covers.clone(),
                     root.cover_requests.clone(),
                     cx,

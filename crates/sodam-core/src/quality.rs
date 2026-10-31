@@ -254,6 +254,16 @@ pub fn stream_rank(info: &libresoda::soda::types::DownloadInfo) -> i64 {
     quality_rank(&info.quality, &info.format, info.bitrate)
 }
 
+/// 从**本地文件**反推档位显示名（没有服务端 `DownloadInfo` 时用）。
+///
+/// `bitrate_bps` 是按「文件字节数 ÷ 探测时长」估出来的平均码率，不是流里的精确值；
+/// 只在「本来就没有准确信息」的场景使用（例如下载时目标文件已存在而跳过）。
+/// 档位换算仍然走 libresoda 的 [`quality_rank`]，避免与界面其它地方的刻度漂移 ——
+/// 传空的质量名，让格式与码率单独决定档位。
+pub fn estimated_stream_label(format: &str, bitrate_bps: i64) -> &'static str {
+    tier_label(quality_rank("", format, bitrate_bps))
+}
+
 /// 实际档位的显示名。
 ///
 /// 必须与 [`is_downgraded`] 用同一套刻度：两者若各按各的边界算，就会出现

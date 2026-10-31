@@ -59,7 +59,7 @@ SodaM 是**汽水音乐的第三方桌面客户端**，面向 Linux / macOS / Wi
 | --- | --- |
 | Linux / Omarchy | 已实测 |
 | macOS（Apple Silicon） | 已实测，提供 Homebrew Cask 与 `.app` 下载 |
-| Windows（x64） | 已实测，提供安装包 |
+| Windows（x64） | 已实测，提供安装包与便携版 zip |
 
 ## 界面预览
 
@@ -132,6 +132,36 @@ SodaM 是**汽水音乐的第三方桌面客户端**，面向 Linux / macOS / Wi
 - 播放请求带序号防竞态，过期结果不会覆盖当前歌曲
 - 帧耗时与滚动压测开关可用于定位 UI 卡顿
 
+### 下载
+
+- 单曲下载：列表 / 队列 / 播放页右键菜单
+- 歌单、专辑、我喜欢的音乐一键「下载全部」，队列化 + 并发上限
+- 下载管理面板：进行中 / 已完成 / 失败三个分区，进度、速度、剩余时间
+- 暂停 / 继续 / 取消 / 重试单条任务，或整体全部暂停与继续
+- 独立「下载音质」设置，与播放音质分离；任务创建时快照档位
+- 下载目录、命名模板（`{artist}` / `{title}` / `{album}`）、并发数、失败重试可配置
+- 可选写入封面与 `.lrc` 歌词旁路文件，分别落在下载目录的 `image/` 与 `lrc/` 子目录；
+  已存在文件按跳过 / 覆盖策略处理
+- 列表 / 队列 / 播放页显示「已下载」标记，详情页头部给出「已下载 N 首」；
+  右键菜单在已下载时变为「重新下载」
+- 左侧导航新增「本地音乐」页：本地库 / 下载中 / 待重下 三分区。下载清单落在下载目录里
+  （`.sodam-downloads.json`），**重启后仍在**；未登录也能进（纯本地内容）
+- 下载与播放缓存目录分离，清理播放缓存不会删掉下载
+
+下载目录布局（以默认命名模板为例）：
+
+```text
+SodaM/                       ← 下载目录
+  Artist - Title.m4a         ← 音频，按命名模板平铺（模板含 / 时会分层）
+  image/
+    Artist - Title.png       ← 封面，扩展名按实际图片格式（png / jpg / webp）
+  lrc/
+    Artist - Title.lrc       ← 歌词
+```
+
+旁路固定落在下载目录的子目录里，不跟随命名模板的分层；某首歌没有封面或歌词时，
+对应文件（必要时连子目录）不会创建。
+
 ## 架构与依赖
 
 ```text
@@ -185,6 +215,9 @@ scripts/run.sh
 | macOS | `~/Library/Application Support/sodam/config.json` |
 | Windows | `%APPDATA%\sodam\config.json` |
 
+Windows 便携版是例外：`sodam.exe` 同目录存在 `portable.txt` 时，配置、缓存与下载
+全部落在程序目录下的 `data/`、`cache/`、`down/`，不写系统目录。
+
 环境变量只在配置字段为空时补全。常用配置：
 
 | 变量 | 说明 |
@@ -202,6 +235,47 @@ scripts/run.sh
 
 日志默认按 `INFO` 记录在本机。设置页「诊断 → 详细日志」可把六个话题全部提到 `DEBUG`，
 即时生效、重启保持；环境变量与这个开关是并集——两边都只能记更多，不存在谁覆盖谁。
+
+下载相关设置在 `config.json` 的 `download` 块里，设置页可直接修改：
+
+```json
+{
+  "download": {
+    "quality": "lossless",
+    "dir": "",
+    "naming": "{artist} - {title}",
+    "write_cover": true,
+    "write_lyrics": true,
+    "concurrent": 2,
+    "retry_count": 2,
+    "overwrite": false
+  }
+}
+```
+
+| 字段 | 说明 |
+| --- | --- |
+| `quality` | 下载优先音质；空或 `auto` = 跟随播放音质 |
+| `dir` | 下载目录；空 = 平台默认「音乐 / SodaM」 |
+| `naming` | 命名模板，支持 `{artist}` / `{title}` / `{album}`，用 `/` 分层 |
+| `write_cover` / `write_lyrics` | 是否写封面 / `.lrc` 歌词旁路（落 `<下载目录>/image/`、`<下载目录>/lrc/`） |
+| `concurrent` | 同时下载数（1–3） |
+| `retry_count` | 网络类失败的自动重试次数（试听 / 无权限不重试） |
+| `overwrite` | 目标文件已存在时覆盖还是跳过 |
+
+播放缓存上限在 `config.json` 的 `cache` 块里（设置页可选预设档位，任意值改这里）：
+
+```json
+{
+  "cache": {
+    "limit_mb": 0
+  }
+}
+```
+
+| 字段 | 说明 |
+| --- | --- |
+| `limit_mb` | 播放缓存上限（MB）；`0` = 不限。占用达到上限的 **85%** 起，按最近最少使用（LRU）淘汰旧缓存。只清理播放缓存（`cache/audio`），**不碰封面缓存，也不碰下载目录** |
 
 SodaM 默认内置一个公共签名服务，未部署 `libmssdk` 的用户也可以直接使用。
 可以在设置页或环境变量中替换为自己的签名服务。
@@ -240,6 +314,16 @@ scripts/run.sh     # 启动 GUI，带 MemoryMax 护栏
 ```
 
 不要在 GUI 运行时编译；不要绕过脚本反复执行全量 cargo 构建。
+
+离线探针（不启动 GUI，验证取流与下载链路）：
+
+```bash
+# 看一首歌实际能拿到什么流（音质 / 是否试听）
+cargo run -p sodam-core --example stream_probe -- "关键词"
+
+# 完整走一遍下载：取流 → 解密 → 落盘 → 封面 / 歌词旁路
+cargo run -p sodam-core --example download_probe -- --search "关键词"
+```
 
 ## Arch Linux 下载安装
 
@@ -395,7 +479,7 @@ open -a SodaM
 ## Windows 下载安装（x64）
 
 Windows 版已在 Windows 10/11 x64 真机实测，GitHub Release 提供 Inno Setup 安装包
-（按用户安装，无需管理员权限），当前版本为
+（按用户安装，无需管理员权限）与便携版 zip，当前版本为
 [`v0.3.7`](https://github.com/sodahub-org/sodam/releases/tag/v0.3.7)。
 
 ### 1. 下载并校验
@@ -431,11 +515,43 @@ if ($expected -ne $actual) { throw "SHA256 mismatch!" } else { "SHA256 OK" }
 首次启动会进入设置页，按提示扫码登录后即可使用。配置保存在
 `%APPDATA%\sodam\config.json`，升级安装不会影响配置。
 
+### 便携版（portable.zip）
+
+不想安装、或想放在 U 盘里带走时用便携版：
+
+```powershell
+mkdir C:\sodam-portable; cd C:\sodam-portable
+
+$version = "0.3.4"
+$base = "https://github.com/sodahub-org/sodam/releases/download/v$version"
+Invoke-WebRequest "$base/sodam-$version-windows-x64-portable.zip" -OutFile "sodam-$version-windows-x64-portable.zip"
+Expand-Archive "sodam-$version-windows-x64-portable.zip" -DestinationPath .
+
+.\SodaM\sodam.exe
+```
+
+解压出来的目录结构：
+
+```text
+SodaM/
+  sodam.exe
+  portable.txt    ← 便携标记；删掉它就退回系统目录
+  down/           ← 默认下载目录
+  data/           ← 登录态与设置（首次启动后生成）
+  cache/          ← 播放缓存与封面缓存（首次使用后生成）
+```
+
+只要 `portable.txt` 与 `sodam.exe` 同目录，配置 / 缓存 / 下载就都留在 `SodaM/` 里，
+不写 `%APPDATA%`，换机器或换 U 盘直接带走。删掉 `portable.txt` 即恢复成普通安装版的
+行为。首次启动同样可能遇到 SmartScreen 提示，处理方式见上一节。
+
 ### 卸载
 
 在「设置 → 应用」或「控制面板 → 程序和功能」中卸载 SodaM。
 
 ## 打包
+
+### Arch Linux
 
 ```bash
 cd packaging/arch
@@ -450,6 +566,19 @@ sudo pacman -U ./sodam-<version>-<arch>.pkg.tar.zst
 /usr/share/applications/sodam.desktop
 /usr/share/icons/hicolor/256x256/apps/sodam.png
 ```
+
+### Windows 便携版 zip
+
+```powershell
+cargo build --release --locked --workspace
+pwsh -File packaging/windows/make-portable-zip.ps1
+# → release/sodam-<version>-windows-x64-portable.zip (+ .sha256)
+```
+
+脚本会把 `sodam.exe`、`LICENSE`、`portable.txt` 与空的 `down/` 打进 zip，
+顶层目录为 `SodaM/`。便携判定的实现在
+[`crates/sodam-core/src/paths.rs`](crates/sodam-core/src/paths.rs)：
+exe 同目录存在 `portable.txt` 时，配置 / 缓存 / 下载全部改走程序目录。
 
 ## 文档
 

@@ -5,7 +5,7 @@
 use crate::ui::i18n::Language;
 use crate::ui::theme::{self, ThemeKind};
 use gpui::prelude::*;
-use gpui::{Context, Window};
+use gpui::Context;
 use sodam_core::audio::PlaybackSnapshot;
 use sodam_core::failure::{PlayBudget, PlaybackFailure, RecoveryAction, Retryability, Stage};
 use sodam_core::library::RecommendationSource;
@@ -19,10 +19,23 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use super::{
-    status_label, BatchUpgradeProgress, LoginState, Nav, QueueOrigin, Root, REMOTE_TEXT,
-    RETRY_TEXT, ROW_BATCH, SAVE_TEXT,
+    status_label, BatchUpgradeProgress, DownloadedIndex, LocalFile, LoginState, Nav, QueueOrigin,
+    Root, REMOTE_TEXT, RETRY_TEXT, ROW_BATCH, SAVE_TEXT,
 };
 use sodam_core::queue::Queue;
+
+/// 本地音乐页合成的曲目 id 前缀（见 `LocalFile::to_track`）。
+///
+/// 这类曲目在汽水没有对应条目：歌词、上报、网络取流都不该发起。
+const LOCAL_TRACK_PREFIX: &str = "local:";
+
+/// 批量匹配时每首之间的间隔：给搜索接口留口气，也让界面有机会刷新。
+const MATCH_BATCH_INTERVAL_MS: u64 = 350;
+
+/// 是不是本地文件合成的曲目（没有汽水 `track_id`）。
+pub(crate) fn is_local_track(track: &TrackItem) -> bool {
+    track.id.starts_with(LOCAL_TRACK_PREFIX)
+}
 
 impl Root {
     /// 设置页贡献者墙：用 contrib.rocks 的组合图，后台拉取并缓存在内存。
@@ -50,8 +63,9 @@ impl Root {
         .detach();
     }
 
-    pub(crate) fn search_input_focused(&self, window: &Window) -> bool {
-        self.search_focus.is_focused(window)
+    /// UI 用：这一行是不是本地文件（本地曲目按定义就在磁盘上）。
+    pub(crate) fn is_local_track(&self, track: &TrackItem) -> bool {
+        is_local_track(track)
     }
 
     /// 预取队列接下来几首到本地缓存（只落盘，不动界面状态）。
@@ -89,6 +103,19 @@ impl Root {
         for next in candidates {
             if self.prefetch_inflight.len() >= max_inflight {
                 break;
+            }
+            // 本地曲目不需要预取：文件已经在磁盘上，`start_track` 会直接装载。
+            // （否则会拿合成 id 去打网络，白白消耗签名服务。）
+            if self.local_playback_path(&next).is_some() {
+                if log {
+                    log_event(
+                        LogLevel::Debug,
+                        LogTopic::Prefetch,
+                        "skip_local_file",
+                        &[("title", next.title.as_str())],
+                    );
+                }
+                continue;
             }
             // 已经在缓存里就不用再排（继续看更后面的：多首预取的意义）
             if let Some(session) = &self.session {
@@ -206,8 +233,11 @@ impl Root {
                 .await;
             let _ = this.update(cx, |root, cx| {
                 let snap = root.engine.snapshot();
-                // 播放进度 / 时长上报：喂一拍快照（内部异步发请求，不阻塞）
-                root.play_reporter.observe(&snap);
+                // 播放进度 / 时长上报：喂一拍快照（内部异步发请求，不阻塞）。
+                // 本地文件合成的曲目（`local:` 前缀）在汽水没有条目，跳过上报。
+                if !snap.track_id.starts_with(LOCAL_TRACK_PREFIX) {
+                    root.play_reporter.observe(&snap);
+                }
                 // 加载完成：引擎已切到 pending 曲目 → 清 loading 态
                 if root.pending_engine_load == Some(snap.load_seq) {
                     root.pending_engine_load = None;
@@ -272,6 +302,8 @@ impl Root {
                 if root.prefetch_patrol % 300 == 0 {
                     root.maintain_cache(cx);
                 }
+                // 下载：消费完成 / 失败事件 + 刷新面板快照（版本号变了才重克隆）
+                root.sync_downloads(cx);
                 root.load_more_recommendation(cx);
             });
         })
@@ -952,7 +984,10 @@ impl Root {
             self.lyrics_return_nav = Some(self.nav);
         }
         self.set_nav(Nav::Lyrics, cx);
-        self.load_lyrics(track, false, cx);
+        // 本地文件没有汽水曲目，歌词接口只会报错。
+        if !is_local_track(&track) {
+            self.load_lyrics(track, false, cx);
+        }
     }
 
     pub(crate) fn ensure_original_cover(&mut self, url: &str, cx: &mut Context<Self>) {
@@ -1417,6 +1452,12 @@ impl Root {
         self.start_recommendation(true, cx);
     }
 
+    /// 进入「推荐」页：**已有推荐队列就直接用，不重新拉网络**。
+    ///
+    /// 启动时已经 `start_recommendation(false)` 拉过一次（队列 = 推荐内容），
+    /// 之前每次点侧边栏都会再拉一遍 —— 用户看到的就是「临时加载」。
+    ///
+    /// 只有队列**不是**推荐来源、或队列为空时才真的去拉。
     pub(crate) fn begin_queue_switch(
         &mut self,
         origin: QueueOrigin,
@@ -1565,31 +1606,80 @@ impl Root {
         self.scroll_lyrics_to(index);
     }
 
+    /// 清空歌词状态（切到没有歌词的曲目时用）。
+    ///
+    /// 只清数据不清 `lyrics_return_nav` —— 那是「从哪来回哪去」的导航状态，与曲目无关。
+    pub(crate) fn clear_lyrics_state(&mut self) {
+        self.lyrics = Arc::new(Vec::new());
+        self.lyrics_track_id.clear();
+        self.lyrics_active = None;
+        self.lyrics_error = None;
+        self.loading_lyrics = false;
+        // 让在途的旧请求作废（回来时看到 seq 不匹配就丢弃）。
+        self.lyrics_request_seq = self.lyrics_request_seq.wrapping_add(1);
+    }
+
     pub(crate) fn ensure_playback_assets(&mut self, track: TrackItem, cx: &mut Context<Self>) {
-        if self.lyrics_track_id != track.id || self.lyrics.is_empty() || self.lyrics_error.is_some()
+        // 本地曲目（合成 id）没有对应的汽水曲目：歌词只从旁路 `.lrc` 来。
+        if is_local_track(&track) {
+            if self.lyrics_track_id != track.id {
+                self.load_local_lyrics(&track);
+            }
+        } else if self.lyrics_track_id != track.id
+            || self.lyrics.is_empty()
+            || self.lyrics_error.is_some()
         {
             self.load_lyrics(track.clone(), false, cx);
         }
-        self.ensure_covers(std::slice::from_ref(&track.cover), cx);
-        self.ensure_original_cover(&track.cover, cx);
+        // 封面来源与 `lyrics_view` 必须**完全一致**：播放页用旁路 `file://` 伪 URL
+        // 取图，这里却拿 `track.cover`（网络 URL）去准备，两者对不上 ——
+        // 表现就是「有封面却一直显示重试加载」。
+        let source = self.playback_cover_source(&track);
+        self.ensure_covers(std::slice::from_ref(&source), cx);
+        self.ensure_original_cover(&source, cx);
+    }
+
+    /// 播放页 / 播放条的封面来源：本地曲目优先旁路图（`file://` 伪 URL）。
+    ///
+    /// **唯一入口** —— 准备与渲染必须用同一个值，否则会出现
+    /// 「已下载原图」判定为假、界面一直显示加载态。
+    pub(crate) fn playback_cover_source(&self, track: &TrackItem) -> String {
+        if is_local_track(track) {
+            if let Some(path) = self
+                .local_files
+                .iter()
+                .find(|file| file.to_track().id == track.id)
+                .and_then(|file| file.cover_path.clone())
+            {
+                return format!("file://{}", path.display());
+            }
+        }
+        track.cover.clone()
     }
 
     pub fn retry_playback_assets(&mut self, track: TrackItem, cx: &mut Context<Self>) {
+        // 来源与渲染 / 准备保持一致（本地曲目是 `file://` 伪 URL）。
+        let source = self.playback_cover_source(&track);
         self.original_cover_attempted
             .lock()
             .ok()
-            .map(|mut attempted| attempted.remove(&track.cover));
+            .map(|mut attempted| attempted.remove(&source));
         self.cover_attempted
             .lock()
             .ok()
-            .map(|mut attempted| attempted.remove(&track.cover));
+            .map(|mut attempted| attempted.remove(&source));
         if let Some(session) = self.session.as_mut() {
-            session.invalidate_original_cover(&track.cover);
-            session.invalidate_cover_path(&track.cover);
+            session.invalidate_original_cover(&source);
+            session.invalidate_cover_path(&source);
         }
-        self.load_lyrics(track.clone(), true, cx);
-        self.ensure_covers(std::slice::from_ref(&track.cover), cx);
-        self.ensure_original_cover(&track.cover, cx);
+        if !is_local_track(&track) {
+            self.load_lyrics(track.clone(), true, cx);
+        } else {
+            // 本地曲目重试：重新读旁路 `.lrc`（文件可能刚被放进来）。
+            self.load_local_lyrics(&track);
+        }
+        self.ensure_covers(std::slice::from_ref(&source), cx);
+        self.ensure_original_cover(&source, cx);
         cx.notify();
     }
 
@@ -1964,7 +2054,11 @@ impl Root {
         if self.nav == nav {
             return;
         }
-        self.nav_history.push(self.nav);
+        // 栈顶与当前页相同就不重复压 —— 详情页（专辑 / 歌手）反复进出时，
+        // 栈里会攒下一串同名项，返回要按很多次才出得去。
+        if self.nav_history.last() != Some(&self.nav) {
+            self.nav_history.push(self.nav);
+        }
         if self.nav_history.len() > 50 {
             self.nav_history.remove(0);
         }
@@ -2224,6 +2318,89 @@ impl Root {
         .detach();
     }
 
+    /// 后台重扫本地目录，一次刷新两样东西：「已下载」标记 + 本地音乐库。
+    ///
+    /// 与 [`Self::refresh_cache_stats`] 同理：扫描是阻塞 I/O，绝不能进渲染路径。
+    /// **扫盘只做一次**，同一份结果同时喂给标记与清单校验（大目录省一半 I/O）。
+    ///
+    /// 另外做了**合并**——已有扫描在跑时只记一个「待重扫」，结束后补扫一次，
+    /// 免得连续触发（切页 / 下载完成 / 改设置）堆出一串重复扫描。
+    pub(crate) fn refresh_local(&mut self, cx: &mut Context<Self>) {
+        if self.local_scanning {
+            self.local_rescan = true;
+            return;
+        }
+        self.local_scanning = true;
+        let settings = self.settings.download.clone();
+        let naming = settings.naming().to_string();
+        let work = cx.background_spawn(async move {
+            // 清单先读：它提供两样东西 —— 元数据、以及**权威时长**（有就不必读盘探测）。
+            let entries = sodam_core::download_library::load(&settings);
+            let known_durations: std::collections::HashMap<std::path::PathBuf, f64> = entries
+                .iter()
+                .filter_map(|entry| {
+                    entry
+                        .duration_seconds
+                        .filter(|seconds| *seconds > 0)
+                        .map(|seconds| (entry.relative.clone(), seconds as f64))
+                })
+                .collect();
+
+            // 一次目录遍历同时喂四样东西：已下载标记、清单校验、本地音乐列表、时长。
+            let scanned = sodam_core::download::scan_local_files(&settings, &known_durations);
+            let sidecars = sodam_core::download::scan_sidecars(&settings);
+            let on_disk: std::collections::HashSet<std::path::PathBuf> =
+                scanned.iter().map(|file| file.relative.clone()).collect();
+            let index = DownloadedIndex::from_paths(on_disk.clone(), &naming);
+            let outcome = sodam_core::download_library::reconcile_with(&on_disk, entries);
+
+            // 本地音乐 = **磁盘真相**：扫到的每个文件一行，清单里有记录就把元数据挂上。
+            // 用户手动放进下载目录的文件因此也会出现在这里（只是没有元数据）。
+            let mut meta: std::collections::HashMap<_, _> = outcome
+                .present
+                .iter()
+                .map(|entry| (entry.relative.clone(), entry.clone()))
+                .collect();
+            let files: Vec<LocalFile> = scanned
+                .into_iter()
+                .map(|file| {
+                    // 旁路按**文件名 stem** 索引（旁路不跟随模板分层）。
+                    let stem = file
+                        .relative
+                        .file_name()
+                        .map(|name| name.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    LocalFile {
+                        entry: meta.remove(&file.relative),
+                        relative: file.relative,
+                        extension: file.extension,
+                        bytes: file.bytes,
+                        probed_duration: file.duration_seconds,
+                        cover_path: sidecars.covers.get(&stem).cloned(),
+                        lyrics_path: sidecars.lyrics.get(&stem).cloned(),
+                    }
+                })
+                .collect();
+            (index, outcome, files)
+        });
+        cx.spawn(async move |this, cx| {
+            let (index, outcome, files) = work.await;
+            let _ = this.update(cx, |root, cx| {
+                root.local_scanning = false;
+                root.downloaded = index;
+                root.library = Arc::new(outcome.present);
+                root.library_missing = Arc::new(outcome.missing);
+                root.local_files = Arc::new(files);
+                cx.notify();
+                if root.local_rescan {
+                    root.local_rescan = false;
+                    root.refresh_local(cx);
+                }
+            });
+        })
+        .detach();
+    }
+
     /// 通用返回：同页详情优先关闭，再按真实访问历史回退。
     pub fn go_back(&mut self, cx: &mut Context<Self>) {
         if self.nav == Nav::Search && self.search_playlist.is_some() {
@@ -2280,6 +2457,8 @@ impl Root {
                 _ => {}
             }
         }
+        // 切页时顺手重扫一次下载目录（合并机制保证不会堆扫描）。
+        self.refresh_local(cx);
     }
 
     /// 封面本地路径（渲染路径唯一入口：只查缓存，不发请求）。
@@ -2592,11 +2771,439 @@ impl Root {
     ///
     /// 不洗牌队列本身：官方是「先进队再随机取下一首」，队列抽屉里仍显示
     /// 真实曲目顺序。洗牌会让「上一首 / 下一首」和抽屉里的顺序对不上。
-    /// 随机播放整张歌单：按原顺序入队，随机挑一首作为起点，并把模式切到随机。
     ///
-    /// 不洗牌队列本身：官方是「先进队再随机取下一首」，队列抽屉里仍能
-    /// 看到真实曲目。顺序上必须先切模式再入队——`play_from` 里的
-    /// `queue.replace` 会清空随机轮次，反过来的话刚生成的轮次立刻失效。
+    /// 顺序上必须先切模式再入队——`play_from` 里的 `queue.replace` 会清空
+    /// 随机轮次，反过来的话刚生成的轮次立刻失效。
+    ///
+    /// 本地曲目 → 磁盘上的真实路径（不是本地曲目则 `None`）。
+    ///
+    /// 判定依据是 `Root.local_files` 里能否按相对路径找到 —— 这是唯一可信的来源
+    /// （合成 id 只是 `local:<relative>` 的字符串，不拿它反解路径）。
+    fn local_playback_path(&self, track: &TrackItem) -> Option<PathBuf> {
+        let file = self
+            .local_files
+            .iter()
+            .find(|file| file.to_track().id == track.id)?;
+        let path = file.absolute_path(&self.settings.download);
+        path.is_file().then_some(path)
+    }
+    /// 本地曲目的音质文案（清单里有就照用，否则 `None` 交给调用方兜底）。
+    fn local_quality_for(&self, track: &TrackItem) -> Option<String> {
+        self.local_files
+            .iter()
+            .find(|file| file.to_track().id == track.id)
+            .and_then(|file| file.entry.as_ref())
+            .and_then(|entry| entry.quality.clone())
+    }
+
+    /// 播放「本地音乐」列表里的一行：文件已经在磁盘上，**直接交给引擎，不联网**。
+    ///
+    /// 与 [`Self::play_from`] 的区别：后者是网络曲目，要走取流 + 解密 + 缓存；
+    /// 这里的文件是本应用下载好的（或用户自己放进下载目录的），直接 `engine.load`。
+    ///
+    /// 队列仍然整表入队（播放完能自动下一首、播放条 / 抽屉能看到列表），
+    /// 只是每一首的装载都从本地文件走（`start_track` 会识别本地曲目）。
+    pub(crate) fn play_local_file(
+        &mut self,
+        files: Arc<Vec<LocalFile>>,
+        index: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(file) = files.get(index) else {
+            return;
+        };
+        let track = file.to_track();
+        let path = file.absolute_path(&self.settings.download);
+        if !path.is_file() {
+            self.set_status_text(self.tr("文件已不在").to_string());
+            cx.notify();
+            return;
+        }
+        let quality = file
+            .entry
+            .as_ref()
+            .and_then(|entry| entry.quality.clone())
+            .unwrap_or_else(|| self.tr("未知音质").to_string());
+
+        // 队列整表入队：自动下一首 / 播放条 / 队列抽屉都依赖它。
+        let tracks: Vec<TrackItem> = files.iter().map(|file| file.to_track()).collect();
+        self.queue.replace(tracks, index);
+        self.played_history.clear();
+        self.queue.mode = sodam_core::queue::PlayMode::ListLoop;
+        self.queue_origin = QueueOrigin::Local;
+        // 歌词：有旁路 `.lrc` 就用它（与网络歌词同一套解析器），否则清掉上一首的。
+        self.load_local_lyrics(&track);
+
+        // 交给引擎（本地文件，没有取流这一步）。
+        self.playing = true;
+        self.play_seq = self.play_seq.wrapping_add(1);
+        self.pending_track = None;
+        self.progress_preview = None;
+        self.playback_error = None;
+        self.consecutive_failures = 0;
+        self.engine.load(
+            track.clone(),
+            sodam_core::session::CachedTrack::from_local(path, quality),
+        );
+        self.set_status("播放中：{}", std::slice::from_ref(&track.title));
+        // 封面：本地曲目走旁路图（`file://` 伪 URL），与播放页的取图来源一致。
+        let cover_source = self.playback_cover_source(&track);
+        self.ensure_covers(std::slice::from_ref(&cover_source), cx);
+        self.sync_queue_cache();
+        cx.notify();
+    }
+
+    /// 本地曲目的歌词：查旁路 `.lrc` → 解析 → 填状态；没有就清空。
+    ///
+    /// 与网络歌词的区别：**不发起任何请求**，也不进 loading 态（文件读取是同步的
+    /// 微秒级操作，且已经在后台扫盘时拿到了路径）。
+    pub(crate) fn load_local_lyrics(&mut self, track: &TrackItem) {
+        let lyrics = self
+            .local_files
+            .iter()
+            .find(|file| file.to_track().id == track.id)
+            .and_then(|file| file.lyrics_path.as_ref())
+            .and_then(|path| sodam_core::download::read_sidecar_lyrics(path));
+        self.clear_lyrics_state();
+        if let Some(lines) = lyrics {
+            self.lyrics_track_id = track.id.clone();
+            self.lyrics = Arc::new(lines);
+        }
+    }
+
+    /// 右键菜单里「匹配」类入口不可用时的统一提示。
+    ///
+    /// 不做静默置灰：用户点下去没反应会以为功能坏了（本次就踩过）。
+    /// `logged_in` 决定提示哪一种原因 —— 未登录是前提条件，优先级更高。
+    pub(crate) fn hint_cannot_match(&mut self, logged_in: bool) {
+        let message = if !logged_in {
+            self.tr("登录后才能匹配本地文件").to_string()
+        } else {
+            self.tr("这首已经匹配过了，不必再匹配").to_string()
+        };
+        self.set_status_text(message.clone());
+        self.notify_warning_once("local-match-unavailable", message);
+    }
+
+    /// 单条「匹配信息」：拿文件名搜汽水，够可信才写回清单。
+    ///
+    /// 匹配不上（返回 `None`）时**打开候选浮层**让用户自己挑 —— 冷门曲目
+    /// 自动分不够，但用户一眼能认出来。
+    pub fn match_local_file(&mut self, relative: PathBuf, cx: &mut Context<Self>) {
+        if self.settings.cookie.trim().is_empty() {
+            self.set_status_text(self.tr("登录后才能使用搜索、歌单与播放").to_string());
+            cx.notify();
+            return;
+        }
+        let Some(file) = self
+            .local_files
+            .iter()
+            .find(|file| file.relative == relative)
+            .cloned()
+        else {
+            return;
+        };
+        let stem = file
+            .relative
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let duration_hint = file.duration_seconds().map(|seconds| seconds as f64);
+        self.set_status_text(self.localized("正在匹配：{}", std::slice::from_ref(&stem)));
+        cx.notify();
+
+        let settings = self.settings.clone();
+        let work_stem = stem.clone();
+        let work = cx.background_spawn(async move {
+            let session = Session::new(settings);
+            sodam_core::match_metadata::search_candidates(&session, &work_stem, duration_hint)
+        });
+        cx.spawn(async move |this, cx| {
+            let result = work.await;
+            let _ =
+                this.update(cx, |root, cx| match result {
+                    Ok(candidates) => {
+                        // 首选够阈值就直接应用，省一步点击。
+                        let best = candidates
+                            .iter()
+                            .find(|outcome| {
+                                outcome.score >= sodam_core::match_metadata::MATCH_THRESHOLD
+                            })
+                            .cloned();
+                        match best {
+                            Some(outcome) => {
+                                root.apply_match(&relative, &outcome.track, outcome.score);
+                                root.refresh_local(cx);
+                            }
+                            None if candidates.is_empty() => {
+                                root.set_status_text(
+                                    root.localized("未找到匹配：{}", std::slice::from_ref(&stem)),
+                                );
+                                cx.notify();
+                            }
+                            None => {
+                                // 有候选但都不够可信 → 让用户自己挑。
+                                let count = candidates.len();
+                                root.set_status_text(root.localized(
+                                    "有 {} 个相似结果，请手动选择",
+                                    &[count.to_string()],
+                                ));
+                                root.match_picker = Some((relative, candidates));
+                                cx.notify();
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        root.set_status_text(root.localized("匹配失败：{err}", &[err.to_string()]));
+                        cx.notify();
+                    }
+                });
+        })
+        .detach();
+    }
+
+    /// 打开「手动选择匹配」浮层：直接拉候选列表（不尝试自动应用）。
+    pub fn open_match_picker(&mut self, relative: PathBuf, cx: &mut Context<Self>) {
+        if self.settings.cookie.trim().is_empty() {
+            self.set_status_text(self.tr("登录后才能使用搜索、歌单与播放").to_string());
+            cx.notify();
+            return;
+        }
+        let Some(file) = self
+            .local_files
+            .iter()
+            .find(|file| file.relative == relative)
+            .cloned()
+        else {
+            return;
+        };
+        let stem = file
+            .relative
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let duration_hint = file.duration_seconds().map(|seconds| seconds as f64);
+        self.set_status_text(self.localized("正在搜索：{}", std::slice::from_ref(&stem)));
+        cx.notify();
+
+        let settings = self.settings.clone();
+        let work_stem = stem.clone();
+        let work = cx.background_spawn(async move {
+            let session = Session::new(settings);
+            sodam_core::match_metadata::search_candidates(&session, &work_stem, duration_hint)
+        });
+        cx.spawn(async move |this, cx| {
+            let result = work.await;
+            let _ = this.update(cx, |root, cx| match result {
+                Ok(candidates) if candidates.is_empty() => {
+                    root.set_status_text(
+                        root.localized("未找到匹配：{}", std::slice::from_ref(&stem)),
+                    );
+                    cx.notify();
+                }
+                Ok(candidates) => {
+                    root.match_picker = Some((relative, candidates));
+                    cx.notify();
+                }
+                Err(err) => {
+                    root.set_status_text(root.localized("匹配失败：{err}", &[err.to_string()]));
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// 用户在浮层里选定某条候选 → 写回清单。
+    pub fn apply_picked_match(
+        &mut self,
+        relative: PathBuf,
+        track: TrackItem,
+        cx: &mut Context<Self>,
+    ) {
+        self.match_picker = None;
+        // 手动选择没有自动分数，用 0 表示"用户指定"。
+        self.apply_match(&relative, &track, 0);
+        self.refresh_local(cx);
+    }
+
+    /// 批量匹配：把所有缺元数据的本地文件逐个匹配，直到全部处理完。
+    ///
+    /// **串行 + 限速**（每首之间歇一下）：批量匹配会打搜索接口，
+    /// 并发或全速会把签名服务打爆（`MODIFICATIONS.md` 里记过同类教训）。
+    /// 每完成一首就刷新一次列表 —— 用户能看着条目一个个「长」出元数据。
+    pub fn match_all_local_files(&mut self, cx: &mut Context<Self>) {
+        if self.matching.is_some() {
+            return;
+        }
+        if self.settings.cookie.trim().is_empty() {
+            self.set_status_text(self.tr("登录后才能使用搜索、歌单与播放").to_string());
+            cx.notify();
+            return;
+        }
+        // 只处理「没有清单记录」或「记录里没有 track_id」的文件 ——
+        // 已经有完整元数据的不必再匹配。
+        let targets: Vec<(PathBuf, String, Option<f64>)> = self
+            .local_files
+            .iter()
+            .filter(|file| {
+                file.entry
+                    .as_ref()
+                    .map(|entry| entry.track_id.is_none())
+                    .unwrap_or(true)
+            })
+            .map(|file| {
+                let stem = file
+                    .relative
+                    .file_name()
+                    .map(|name| name.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                (
+                    file.relative.clone(),
+                    stem,
+                    file.duration_seconds().map(|s| s as f64),
+                )
+            })
+            .collect();
+        if targets.is_empty() {
+            self.set_status_text(self.tr("没有需要匹配的文件").to_string());
+            cx.notify();
+            return;
+        }
+        let total = targets.len();
+        self.matching = Some((0, total));
+        self.set_status_text(self.localized("开始匹配 {} 个文件…", &[total.to_string()]));
+        cx.notify();
+        self.run_match_batch(targets, cx);
+    }
+
+    /// 批量匹配的驱动：每次处理一首，完成后等一小会儿再处理下一首。
+    fn run_match_batch(
+        &mut self,
+        mut targets: Vec<(PathBuf, String, Option<f64>)>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((relative, stem, duration_hint)) = targets.first().cloned() else {
+            // 全部处理完
+            let (done, total) = self.matching.unwrap_or((0, 0));
+            self.matching = None;
+            self.set_status_text(self.localized(
+                "匹配完成：{} 首（共 {} 首）",
+                &[done.to_string(), total.to_string()],
+            ));
+            cx.notify();
+            self.refresh_local(cx);
+            return;
+        };
+        targets.remove(0);
+        let settings = self.settings.clone();
+        let work = cx.background_spawn(async move {
+            let session = Session::new(settings);
+            sodam_core::match_metadata::match_track(&session, &stem, duration_hint)
+        });
+        cx.spawn(async move |this, cx| {
+            let result = work.await;
+            let _ = this.update(cx, |root, cx| {
+                match result {
+                    Ok(Some(outcome)) => {
+                        root.apply_match(&relative, &outcome.track, outcome.score);
+                        if let Some((done, total)) = root.matching.as_mut() {
+                            *done += 1;
+                            let text = format!("{} / {}", *done, *total);
+                            root.set_status_text(root.localized("匹配中：{}", &[text]));
+                        }
+                    }
+                    Ok(None) => {
+                        if let Some((done, total)) = root.matching.as_mut() {
+                            *done += 1;
+                            let text = format!("{} / {}", *done, *total);
+                            root.set_status_text(root.localized("匹配中：{}", &[text]));
+                        }
+                    }
+                    Err(err) => {
+                        // 网络类失败：中断整批（继续只会连着失败）
+                        root.matching = None;
+                        root.set_status_text(root.localized("匹配失败：{err}", &[err.to_string()]));
+                        cx.notify();
+                        return;
+                    }
+                }
+                cx.notify();
+            });
+            // 限速：给搜索接口留口气，也让界面有机会刷新。
+            // 注意：`await` 必须在 `update` 闭包**之外** —— 闭包是同步的。
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(MATCH_BATCH_INTERVAL_MS))
+                .await;
+            let _ = this.update(cx, |root, cx| {
+                root.run_match_batch(targets, cx);
+            });
+        })
+        .detach();
+    }
+
+    /// 把匹配结果写回清单（保留原有音质与入库时间）。
+    fn apply_match(&mut self, relative: &PathBuf, track: &TrackItem, score: i32) {
+        let settings = self.settings.download.clone();
+        let existing = sodam_core::download_library::load(&settings)
+            .into_iter()
+            .find(|entry| &entry.relative == relative);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|delta| delta.as_secs() as i64)
+            .unwrap_or(0);
+        let entry = sodam_core::download_library::LibraryEntry {
+            relative: relative.clone(),
+            extension: existing
+                .as_ref()
+                .map(|entry| entry.extension.clone())
+                .or_else(|| {
+                    self.local_files
+                        .iter()
+                        .find(|file| &file.relative == relative)
+                        .map(|file| file.extension.clone())
+                })
+                .unwrap_or_else(|| "m4a".to_string()),
+            source: sodam_core::download_library::EntrySource::Scanned,
+            bytes: existing
+                .as_ref()
+                .map(|entry| entry.bytes)
+                .or_else(|| {
+                    self.local_files
+                        .iter()
+                        .find(|file| &file.relative == relative)
+                        .map(|file| file.bytes)
+                })
+                .unwrap_or(0),
+            added_at: existing.as_ref().map(|entry| entry.added_at).unwrap_or(now),
+            // 音质未知：文件是用户自己放进来 / 迁移来的，不冒充已知音质。
+            quality: existing.as_ref().and_then(|entry| entry.quality.clone()),
+            downloaded_at: existing.as_ref().and_then(|entry| entry.downloaded_at),
+            mtime: existing.as_ref().and_then(|entry| entry.mtime),
+            track_id: Some(track.id.clone()),
+            title: Some(track.title.clone()),
+            artist: Some(track.artist.clone()),
+            album: Some(track.album.clone()),
+            artist_id: Some(track.artist_id.clone()),
+            album_id: Some(track.album_id.clone()),
+            cover: Some(track.cover.clone()),
+            duration_seconds: Some(track.duration_seconds).filter(|seconds| *seconds > 0),
+            vip: Some(track.vip),
+        };
+        match sodam_core::download_library::upsert(&settings, entry) {
+            Ok(_) => {
+                self.set_status_text(self.localized(
+                    "已匹配：{}（{} 分）",
+                    &[track.title.clone(), score.to_string()],
+                ));
+            }
+            Err(err) => {
+                self.set_status_text(self.localized("写入清单失败：{err}", &[err.to_string()]));
+            }
+        }
+    }
+
+    /// 随机播放整张歌单：清空当前队列，按洗牌后的顺序从第一首开始。
     pub fn shuffle_play_arc(
         &mut self,
         tracks: std::sync::Arc<Vec<TrackItem>>,
@@ -2616,7 +3223,6 @@ impl Root {
         cx.notify();
     }
 
-    /// 点歌单/收藏列表里的某一行播放（把该列表整体入队）。
     /// 点歌单/收藏列表里的某一行播放（把该列表整体入队）。
     pub fn play_from(&mut self, tracks: Vec<TrackItem>, index: usize, cx: &mut Context<Self>) {
         if tracks.is_empty() {
@@ -2863,6 +3469,9 @@ impl Root {
     }
 
     /// 装载并播放「当前队列曲目」：后台下载+解密 → 回 UI 线程交给引擎。
+    ///
+    /// 本地音乐队列（`QueueOrigin::Local`）是例外：文件已在磁盘上，
+    /// 直接交给引擎，不走进度条前面的网络路径（见 [`Self::play_local_file`]）。
     pub fn start_track(&mut self, cx: &mut Context<Self>) {
         let Some(track) = self.queue.current().cloned() else {
             self.set_status_text(self.tr("队列是空的：先去搜索或打开一张歌单"));
@@ -2872,6 +3481,37 @@ impl Root {
         // 走到这里就是一次被明确要求（或被允许）的播放尝试：闸门若开着，说明是用户
         // 按了播放/切歌，熔断回半开。自动续播路径在巡检处已被闸门拦住。
         self.release_playback_halt();
+        // 本地曲目：从磁盘直接装载。合成 id（`local:` 前缀）没有对应的汽水曲目，
+        // 走网络只会连续失败（自动切下一首时会踩到）。
+        if let Some(path) = self.local_playback_path(&track) {
+            self.playing = true;
+            self.play_seq = self.play_seq.wrapping_add(1);
+            self.pending_track = None;
+            self.progress_preview = None;
+            self.playback_error = None;
+            self.consecutive_failures = 0;
+            // 歌词：有旁路 `.lrc` 就用它，否则清掉上一首的（本地文件没有汽水曲目）。
+            self.load_local_lyrics(&track);
+            let quality = self
+                .local_quality_for(&track)
+                .unwrap_or_else(|| self.tr("未知音质").to_string());
+            self.engine.load(
+                track.clone(),
+                sodam_core::session::CachedTrack::from_local(path, quality),
+            );
+            self.set_status("播放中：{}", std::slice::from_ref(&track.title));
+            // 封面：与播放页取图来源一致（本地曲目走旁路 `file://` 伪 URL）。
+            let cover_source = self.playback_cover_source(&track);
+            self.ensure_covers(std::slice::from_ref(&cover_source), cx);
+            cx.notify();
+            return;
+        }
+        log_event(
+            LogLevel::Debug,
+            LogTopic::Player,
+            "load_start",
+            &[("title", track.title.as_str()), ("id", track.id.as_str())],
+        );
         self.playing = true;
         self.play_seq = self.play_seq.wrapping_add(1);
         let request_seq = self.play_seq;
@@ -2880,7 +3520,7 @@ impl Root {
         self.progress_preview = None;
         self.set_status("正在准备播放：{}…", std::slice::from_ref(&track.title));
         self.ensure_covers(std::slice::from_ref(&track.cover), cx);
-        if self.nav == Nav::Lyrics {
+        if self.nav == Nav::Lyrics && !is_local_track(&track) {
             self.load_lyrics(track.clone(), false, cx);
         }
         cx.notify();
@@ -3056,6 +3696,7 @@ impl Root {
     #[allow(dead_code)] // 设置表单（roadmap 第 3 项）接入后由保存按钮调用
     pub fn apply_settings(&mut self, settings: Settings) {
         let reporter_settings = settings.clone();
+        let download_settings = settings.download.clone();
         match self
             .session
             .as_mut()
@@ -3075,6 +3716,11 @@ impl Root {
             }
         }
         self.play_reporter.apply_settings(reporter_settings);
+        // 下载管理器持有的是设置快照：换账号 / 改音质后必须同步，
+        // 否则队列里新排的任务还会用旧的 Cookie 去取流。
+        self.downloads.set_settings(self.settings.clone());
+        self.downloads.set_download_settings(download_settings);
+        self.download_settings_fingerprint = self.settings.fingerprint();
     }
 }
 

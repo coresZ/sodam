@@ -60,14 +60,12 @@ pub(crate) fn invalidate_audio(path: &Path) {
 }
 
 pub fn root_dir() -> PathBuf {
-    std::env::var_os("SODAM_CACHE_DIR")
-        .filter(|path| !path.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            dirs::cache_dir()
-                .unwrap_or_else(std::env::temp_dir)
-                .join("sodam")
-        })
+    // 便携模式下必须跟着程序目录走（`paths` 负责判定），否则便携版会把缓存
+    // 写进用户目录，与「插 U 盘就能带走」的承诺冲突。
+    if let Some(path) = std::env::var_os("SODAM_CACHE_DIR").filter(|path| !path.is_empty()) {
+        return PathBuf::from(path);
+    }
+    crate::paths::cache_dir()
 }
 
 // .quality 与音频共享保护键，避免播放/下载时只删了 sidecar。

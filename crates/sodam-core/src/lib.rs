@@ -7,12 +7,16 @@ pub mod cache;
 pub mod color;
 pub mod config;
 pub mod contributors;
+pub mod download;
+pub mod download_library;
 pub mod failure;
 pub mod library;
 pub mod log_outlet;
 pub mod login;
+pub mod match_metadata;
 pub mod mem;
 pub mod models;
+pub mod paths;
 pub mod play_report;
 pub mod playback_trace;
 pub mod preferences;
@@ -22,6 +26,9 @@ pub mod session;
 
 pub use audio::{PlaybackEngine, PlaybackSnapshot};
 pub use config::Settings;
+pub use download::{
+    DownloadCounts, DownloadEvent, DownloadManager, DownloadSettings, DownloadState, DownloadTask,
+};
 pub use log_outlet::{flush_global, LogLevel, LogOutlet, LogRecord, LogTopic};
 pub use models::{PlaylistItem, SceneItem, TrackItem};
 pub use play_report::PlayReporter;
