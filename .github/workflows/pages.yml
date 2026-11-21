@@ -41,6 +41,9 @@ concurrency:
 jobs:
   publish:
     name: 构建并发布官网 + pacman 源
+    # 只在官方仓库发布：fork 里 Pages 通常没开，而且这里生成的 pacman.conf
+    # 硬编码了 `sodahub-org.github.io`，在别处部署只会指向错误的源。
+    if: github.repository == 'sodahub-org/sodam'
     runs-on: ubuntu-latest
     environment:
       name: github-pages

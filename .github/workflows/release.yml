@@ -241,6 +241,9 @@ jobs:
 
   pages:
     name: Publish site + pacman repo
+    # 只在官方仓库发布站点与 pacman 源：fork 里 Pages 通常没开，
+    # 且 `pages.yml` 生成的 pacman.conf 硬编码了官方域名。
+    if: github.repository == 'sodahub-org/sodam'
     needs: [github-release]
     uses: ./.github/workflows/pages.yml
     with:
