@@ -20,6 +20,7 @@ fn icon_name(nav: Nav) -> &'static str {
         Nav::Artist | Nav::Album => "search",
         Nav::Settings => "settings",
         Nav::Lyrics => "music",
+        Nav::Local => "disc-3",
     }
 }
 
@@ -51,8 +52,10 @@ fn nav_row(nav: Nav, label: String, selected: bool, cx: &mut Context<Root>) -> A
         .text_color(foreground)
         .text_size(theme::Text::Body.size())
         .on_click(cx.listener(move |root, _event: &ClickEvent, _window, cx| {
-            // 未登录时只放行「设置」，其他入口都拦回去（登录在设置 → 账户）
-            if root.settings.cookie.trim().is_empty() && nav != Nav::Settings {
+            // 未登录时只放行「设置」和「本地音乐」：
+            // 前者是登录入口，后者是纯本地内容，都不该被登录态拦下。
+            if root.settings.cookie.trim().is_empty() && !matches!(nav, Nav::Settings | Nav::Local)
+            {
                 root.set_nav(Nav::Settings, cx);
                 root.set_status("请先在「设置 → 账户」扫码登录", &[]);
                 return;
@@ -116,6 +119,7 @@ pub fn render(root: &Root, cx: &mut Context<Root>, own_titlebar: bool) -> impl I
         Nav::Search,
         Nav::Liked,
         Nav::Library,
+        Nav::Local,
         Nav::Settings,
     ]
     .into_iter()
@@ -132,7 +136,7 @@ pub fn render(root: &Root, cx: &mut Context<Root>, own_titlebar: bool) -> impl I
             nav_row(nav, labels[&nav].clone(), active, cx)
         })
         .collect();
-    let library_items: Vec<AnyElement> = [Nav::Liked, Nav::Library]
+    let library_items: Vec<AnyElement> = [Nav::Liked, Nav::Library, Nav::Local]
         .into_iter()
         .map(|nav| {
             let active = match nav {

@@ -13,7 +13,7 @@
 //!
 //! gpui 匹配修饰键是**精确**的：`ctrl-a` 不会命中 `ctrl-shift-a`，所以每个变体都得单独绑一条。
 
-use crate::app::{Nav, Root};
+use crate::app::{ActiveInput, Nav, Root};
 use crate::shortcuts::{GLOBAL_CONTEXT, INPUT_CONTEXT};
 use crate::ui::text_field::{Direction, Edge, TextField, Unit};
 use gpui::{actions, ClipboardItem, Context, KeyBinding, Window};
@@ -117,6 +117,18 @@ pub fn focus_bindings() -> Vec<KeyBinding> {
 }
 
 impl Root {
+    /// 当前活动输入框的可变引用。
+    ///
+    /// 唯一的「按焦点选字段」入口：`app_text` 里所有动作都经它拿字段，
+    /// 所以新增输入框只需要在这里加一条分支，动作本身不必改。
+    fn active_field_mut(&mut self) -> Option<(&mut TextField, bool)> {
+        match self.active_input {
+            Some(ActiveInput::Search) => Some((&mut self.search_field, true)),
+            Some(ActiveInput::LocalFilter) => Some((&mut self.local_filter_field, false)),
+            None => None,
+        }
+    }
+
     /// 改一处文本状态：先开撤销事务，真有变化才通知重绘。
     ///
     /// 事务的边界就放在这个唯一的收口处：`begin_edit` 记下改动之前的完整状态，`end_edit`
@@ -129,26 +141,51 @@ impl Root {
         edit: impl FnOnce(&mut TextField) -> bool,
     ) {
         let now = self.search_edit_time();
-        self.search_field.begin_edit();
-        let changed = edit(&mut self.search_field);
-        self.search_field.end_edit(now);
+        // 先取字段做完编辑就放掉借用，后面才能再借 `self` 去修正视口。
+        let (changed, is_search) = {
+            let Some((field, is_search)) = self.active_field_mut() else {
+                return;
+            };
+            field.begin_edit();
+            let changed = edit(field);
+            field.end_edit(now);
+            (changed, is_search)
+        };
         if changed {
-            self.search_fit_caret_in_view(window);
+            if is_search {
+                self.search_fit_caret_in_view(window);
+            }
             cx.notify();
         }
     }
 
     /// 撤销与重做不走 `edit_text`：要恢复哪一份快照由状态层自己决定，不需要再开事务。
     pub(crate) fn text_undo(&mut self, _: &Undo, window: &mut Window, cx: &mut Context<Self>) {
-        if self.search_field.undo() {
-            self.search_fit_caret_in_view(window);
+        let (changed, is_search) = {
+            let Some((field, is_search)) = self.active_field_mut() else {
+                return;
+            };
+            (field.undo(), is_search)
+        };
+        if changed {
+            if is_search {
+                self.search_fit_caret_in_view(window);
+            }
             cx.notify();
         }
     }
 
     pub(crate) fn text_redo(&mut self, _: &Redo, window: &mut Window, cx: &mut Context<Self>) {
-        if self.search_field.redo() {
-            self.search_fit_caret_in_view(window);
+        let (changed, is_search) = {
+            let Some((field, is_search)) = self.active_field_mut() else {
+                return;
+            };
+            (field.redo(), is_search)
+        };
+        if changed {
+            if is_search {
+                self.search_fit_caret_in_view(window);
+            }
             cx.notify();
         }
     }
@@ -296,7 +333,10 @@ impl Root {
 
     /// 无选区时什么都不复制：把整串查询悄悄写进剪贴板，用户下次粘贴时会吃个意外。
     pub(crate) fn text_copy(&mut self, _: &Copy, _window: &mut Window, cx: &mut Context<Self>) {
-        let selected = self.search_field.selected_text();
+        let Some((field, _)) = self.active_field_mut() else {
+            return;
+        };
+        let selected = field.selected_text();
         if selected.is_empty() {
             return;
         }
@@ -304,7 +344,10 @@ impl Root {
     }
 
     pub(crate) fn text_cut(&mut self, _: &Cut, window: &mut Window, cx: &mut Context<Self>) {
-        let selected = self.search_field.selected_text();
+        let Some((field, _)) = self.active_field_mut() else {
+            return;
+        };
+        let selected = field.selected_text();
         if selected.is_empty() {
             return;
         }
@@ -323,16 +366,25 @@ impl Root {
     }
 
     pub(crate) fn text_submit(&mut self, _: &Submit, _window: &mut Window, cx: &mut Context<Self>) {
-        self.run_search(cx);
+        // 过滤框是即时生效的，回车没有额外动作；只有搜索页需要真正发起搜索。
+        if self.active_input == Some(ActiveInput::Search) {
+            self.run_search(cx);
+        }
     }
 
     /// Esc 的三级优先：先撤 IME 组合，再折叠选区，最后才清空整串（三者都不夺焦点）。
     pub(crate) fn text_cancel(&mut self, _: &Cancel, window: &mut Window, cx: &mut Context<Self>) {
-        if self.search_field.clear_marked() {
+        let (marked, collapsed) = {
+            let Some((field, _)) = self.active_field_mut() else {
+                return;
+            };
+            (field.clear_marked(), field.collapse_selection())
+        };
+        if marked {
             cx.notify();
             return;
         }
-        if self.search_field.collapse_selection() {
+        if collapsed {
             cx.notify();
             return;
         }

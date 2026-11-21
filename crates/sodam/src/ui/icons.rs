@@ -135,6 +135,8 @@ icon_set!(
     "disc-3",
     "check",
     "ban",
+    "download",
+    "folder-open",
 );
 
 /// 听歌模式内置图标路径。
